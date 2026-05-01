@@ -5,6 +5,10 @@ import torch
 import torchaudio
 from pytorch_lightning import LightningDataModule
 
+from src.data.data_transforms import (
+    TrainTransform, ValTransform, TestTransform
+    )
+
 
 def _batch_by_token_count(idx_target_lengths, max_tokens, batch_size=None):
     batches = []
@@ -117,6 +121,7 @@ class LibriSpeechDataModule(LightningDataModule):
         train_num_buckets=50,
         train_shuffle=True,
         num_workers=10,
+        sanity_check=False,
     ):
         super().__init__()
         self.librispeech_path = librispeech_path
@@ -130,13 +135,19 @@ class LibriSpeechDataModule(LightningDataModule):
         self.train_num_buckets = train_num_buckets
         self.train_shuffle = train_shuffle
         self.num_workers = num_workers
+        self.sanity_check = sanity_check
 
     def train_dataloader(self):
-        datasets = [
-            self.librispeech_cls(self.librispeech_path, url="train-clean-360"),
-            self.librispeech_cls(self.librispeech_path, url="train-clean-100"),
-            self.librispeech_cls(self.librispeech_path, url="train-other-500"),
-        ]
+        if self.sanity_check:
+            datasets = [
+                self.librispeech_cls(self.librispeech_path, url="dev-clean")
+            ]
+        else:
+            datasets = [
+                self.librispeech_cls(self.librispeech_path, url="train-clean-360"),
+                self.librispeech_cls(self.librispeech_path, url="train-clean-100"),
+                self.librispeech_cls(self.librispeech_path, url="train-other-500"),
+            ]
 
         if not self.train_dataset_lengths:
             self.train_dataset_lengths = [get_sample_lengths(dataset) for dataset in datasets]
@@ -163,10 +174,15 @@ class LibriSpeechDataModule(LightningDataModule):
         return dataloader
 
     def val_dataloader(self):
-        datasets = [
-            self.librispeech_cls(self.librispeech_path, url="dev-clean"),
-            self.librispeech_cls(self.librispeech_path, url="dev-other"),
-        ]
+        if self.sanity_check:
+            datasets = [
+                self.librispeech_cls(self.librispeech_path, url="dev-clean")
+            ]
+        else:
+            datasets = [
+                self.librispeech_cls(self.librispeech_path, url="dev-clean"),
+                self.librispeech_cls(self.librispeech_path, url="dev-other"),
+            ]
 
         if not self.val_dataset_lengths:
             self.val_dataset_lengths = [get_sample_lengths(dataset) for dataset in datasets]
@@ -188,7 +204,34 @@ class LibriSpeechDataModule(LightningDataModule):
         return dataloader
 
     def test_dataloader(self):
-        dataset = self.librispeech_cls(self.librispeech_path, url="test-clean")
+        if self.sanity_check:
+            dataset = self.librispeech_cls(self.librispeech_path, url="dev-clean")
+        else:
+            dataset = self.librispeech_cls(self.librispeech_path, url="test-clean")
         dataset = TransformDataset(dataset, self.test_transform)
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
         return dataloader
+    
+
+def get_data_module(
+        librispeech_path, 
+        global_stats_path, 
+        sp_model_path,
+        sanity_check=False,
+        ):
+    train_transform = TrainTransform(
+        global_stats_path=global_stats_path, sp_model_path=sp_model_path
+        )
+    val_transform = ValTransform(
+        global_stats_path=global_stats_path, sp_model_path=sp_model_path
+        )
+    test_transform = TestTransform(
+        global_stats_path=global_stats_path, sp_model_path=sp_model_path
+        )
+    return LibriSpeechDataModule(
+        librispeech_path=librispeech_path,
+        train_transform=train_transform,
+        val_transform=val_transform,
+        test_transform=test_transform,
+        sanity_check=sanity_check,
+    )

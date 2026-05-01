@@ -2,12 +2,16 @@ import json
 import math
 from functools import partial
 from typing import List
+from collections import namedtuple
 
 import sentencepiece as spm
 import torch
 import torchaudio
-from data_module import LibriSpeechDataModule
-from lightning import Batch
+# from src.data.librispeech_data_module import LibriSpeechDataModule
+
+
+# from lightning import Batch
+Batch = namedtuple("Batch", ["inputs", "input_lengths", "targets", "target_lengths"])
 
 
 _decibel = 2 * 20 * math.log10(torch.iinfo(torch.int16).max)
@@ -105,15 +109,3 @@ class TestTransform:
 
     def __call__(self, sample):
         return self.val_transforms([sample]), [sample]
-
-
-def get_data_module(librispeech_path, global_stats_path, sp_model_path):
-    train_transform = TrainTransform(global_stats_path=global_stats_path, sp_model_path=sp_model_path)
-    val_transform = ValTransform(global_stats_path=global_stats_path, sp_model_path=sp_model_path)
-    test_transform = TestTransform(global_stats_path=global_stats_path, sp_model_path=sp_model_path)
-    return LibriSpeechDataModule(
-        librispeech_path=librispeech_path,
-        train_transform=train_transform,
-        val_transform=val_transform,
-        test_transform=test_transform,
-    )
