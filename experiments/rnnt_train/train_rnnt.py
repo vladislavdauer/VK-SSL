@@ -9,6 +9,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
 
 from src.models.asr_lightning_module import ConformerRNNTModule
+from src.models.asr_lightning_module import CTCTModule
 from src.data.librispeech_data_module import get_data_module
 
 def run_train(args):
@@ -57,7 +58,12 @@ def run_train(args):
     )
 
     sp_model = spm.SentencePieceProcessor(model_file=str(args.sp_model_path))
-    model = ConformerRNNTModule(args, sp_model)
+
+    if args.model_type == "conformer_RNNT":
+        model = ConformerRNNTModule(args, sp_model)
+    elif args.model_type == "CTC":
+        model = CTCTModule(args, sp_model)
+
     data_module = get_data_module(
         str(args.librispeech_path), 
         str(args.global_stats_path), 
