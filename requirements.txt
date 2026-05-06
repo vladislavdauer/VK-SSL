@@ -1,5 +1,0 @@
-torchaudio
-torch
-pytorch-lightning
-sentencepiece
-tensorboard
