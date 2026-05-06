@@ -59,7 +59,7 @@ def run_train(args):
 
     sp_model = spm.SentencePieceProcessor(model_file=str(args.sp_model_path))
 
-    if args.model_type == "conformer_RNNT":
+    if args.model_type == "Сonformer_RNNT":
         model = ConformerRNNTModule(args, sp_model)
     elif args.model_type == "CTC":
         model = CTCTModule(args, sp_model)
