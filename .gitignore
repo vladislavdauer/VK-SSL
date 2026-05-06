@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 librispeech/
 *.egg-info/
+experiments/rnnt_train/datasets
