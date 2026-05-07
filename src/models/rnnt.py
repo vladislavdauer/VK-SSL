@@ -552,6 +552,7 @@ class _ConformerEncoder(torch.nn.Module, _Transcriber):
         conformer_dropout: float,
     ) -> None:
         super().__init__()
+        self.output_dim = output_dim
         self.time_reduction = _TimeReduction(time_reduction_stride)
         self.input_linear = torch.nn.Linear(input_dim * time_reduction_stride, conformer_input_dim)
         self.conformer = Conformer(
