@@ -20,8 +20,103 @@ _expected_spm_vocab_size = 1023
 Batch = namedtuple("Batch", ["inputs", "input_lengths", "targets", "target_lengths"])
 
 class CTCTModule(LightningModule):
-    def __init__(self):
-        raise NotImplementedError()
+    def __init__(self, args=None, sp_model=None, pretrained_model_path=None):
+        super().__init__()
+        self.save_hyperparameters(args)
+        self.args = args
+        self.sp_model = sp_model
+        spm_vocab_size = self.sp_model.get_piece_size()
+
+        # Поменять assert
+        assert spm_vocab_size == _expected_spm_vocab_size, (
+            "The model returned by conformer_rnnt_base expects a SentencePiece model of "
+            f"vocabulary size {_expected_spm_vocab_size}, but the given SentencePiece model has a vocabulary size "
+            f"of {spm_vocab_size}. Please provide a correctly configured SentencePiece model."
+        )
+        self.blank_idx = spm_vocab_size
+
+        self.frontend = None
+        self.encoder = conformer_rnnt_base().transcriber
+
+        self.ctc_out = torch.nn.Linear(self.encoder.output_dim , spm_vocab_size + 1)
+        self.log_softmax = torch.nn.LogSoftmax(dim=-1)
+
+        self.loss = torch.nn.CTCLoss(blank=self.blank_idx, reduction="sum")
+
+        self.optimizer = torch.optim.AdamW(
+            itertools.chain(*([self.encoder.parameters(), self.ctc_out.parameters()])),
+            lr=8e-4,
+            weight_decay=0.06,
+            betas=(0.9, 0.98),
+        )
+
+    def _step(self, batch, _, step_type):
+        if batch is None:
+            return None
+
+        features = batch.inputs
+        output, src_lengths = self.encoder(
+            features, batch.input_lengths
+        )
+
+        layer = self.ctc_out(output)
+        probs = self.log_softmax(layer).transpose(0, 1)
+
+        loss = self.loss(probs, batch.targets, src_lengths, batch.target_lengths)
+        self.log(f"Losses/{step_type}_loss", loss, on_step=True, on_epoch=True)
+
+        return loss
+
+    def forward(self, batch):
+        features = batch.inputs.to(self.device)
+        encoder_out, src_lengths = self.encoder(features, batch.input_lengths.to(self.device))
+        logits = self.ctc_out(encoder_out)
+        log_probs = self.log_softmax(logits)
+
+        predicted_ids = torch.argmax(log_probs, dim=-1)
+
+        results = []
+        for seq in predicted_ids:
+            collapsed = []
+            prev = self.blank_idx
+            for idx in seq:
+                if idx != prev and idx != self.blank_idx:
+                    collapsed.append(idx.item())
+                prev = idx
+            results.append(self.sp_model.decode(collapsed))
+
+        return results[0] if len(results) == 1 else results
+
+    def configure_optimizers(self):
+        self.warmup_lr_scheduler = WarmupCosineScheduler(
+            self.optimizer,
+            10,
+            self.args.epochs,
+            len(self.trainer.datamodule.train_dataloader()) / self.trainer.num_devices / self.trainer.num_nodes,
+        )
+        self.lr_scheduler_interval = "step"
+        return (
+            [self.optimizer],
+            [{"scheduler": self.warmup_lr_scheduler, "interval": self.lr_scheduler_interval}],
+        )
+
+    def training_step(self, batch, batch_idx):
+        loss = self._step(batch, batch_idx, "train")
+        batch_size = batch.inputs.size(0)
+        batch_sizes = self.all_gather(batch_size)
+
+        if isinstance(batch_sizes, torch.Tensor) and batch_sizes.dim() > 0:
+            loss *= batch_sizes.size(0) / batch_sizes.sum()
+
+        self.log("monitoring_step", torch.tensor(self.global_step, dtype=torch.float32))
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        return self._step(batch, batch_idx, "val")
+
+    def test_step(self, batch, batch_idx):
+        return self._step(batch, batch_idx, "test")
 
 def post_process_hypos(
     hypos: List[Hypothesis], sp_model: spm.SentencePieceProcessor
