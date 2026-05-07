@@ -105,6 +105,13 @@ def cli_main():
         required=True,
     )
     parser.add_argument(
+        "--model_type",
+        type=str,
+        default="Conformer_RNNT",
+        choices=["Conformer_RNNT", "CTC"],
+        help="Type of model architecture to train. (Default: 'Conformer_RNNT')",
+    )
+    parser.add_argument(
         "--nodes",
         default=1,
         type=int,
