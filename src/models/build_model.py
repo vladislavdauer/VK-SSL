@@ -48,6 +48,7 @@ def conformer_rnnt_model(
     return RNNT(encoder, predictor, joiner)
 
 
+# TODO: make custom pass args
 def conformer_rnnt_base() -> RNNT:
     r"""Builds basic version of Conformer RNN-T model.
 

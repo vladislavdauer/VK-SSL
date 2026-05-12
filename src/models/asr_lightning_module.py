@@ -10,7 +10,7 @@ import torch
 import torchaudio
 from pytorch_lightning import LightningModule
 
-from src.models.rnnt import conformer_rnnt_base
+from src.models.build_model import conformer_rnnt_base
 from src.models.audio_resnet import audio_resnet
 from src.opt.schedulers import WarmupCosineScheduler
 from src.models.rnnt_decoder import Hypothesis, RNNTBeamSearch
