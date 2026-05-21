@@ -10,7 +10,7 @@ import torch
 import torchaudio
 from pytorch_lightning import LightningModule
 
-from src.models.rnnt import conformer_rnnt_base
+from src.models.build_model import conformer_rnnt_base
 from src.models.audio_resnet import audio_resnet
 from src.opt.schedulers import WarmupCosineScheduler
 from src.models.rnnt_decoder import Hypothesis, RNNTBeamSearch
@@ -209,7 +209,8 @@ class ConformerRNNTModule(LightningModule):
 
     def forward(self, batch):
         decoder = RNNTBeamSearch(self.model, self.blank_idx)
-        x = self.frontend(batch.inputs.to(self.device))
+        # x = self.frontend(batch.inputs.to(self.device))
+        x = batch.inputs.to(self.device)
         hypotheses = decoder(x, batch.input_lengths.to(self.device), beam_width=20)
         return post_process_hypos(hypotheses, self.sp_model)[0][0]
 
