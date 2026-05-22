@@ -41,15 +41,14 @@ class CTCTModule(LightningModule):
         self.ctc_out = torch.nn.Linear(self.encoder.output_dim , spm_vocab_size + 1)
         self.log_softmax = torch.nn.LogSoftmax(dim=-1)
 
-        self.loss = torch.nn.CTCLoss(blank=self.blank_idx, reduction="sum")
+        self.loss = torch.nn.CTCLoss(blank=self.blank_idx, reduction="mean")
 
         self.optimizer = torch.optim.AdamW(
             itertools.chain(*([self.encoder.parameters(), self.ctc_out.parameters()])),
-            lr=3e-5,
+            lr=3e-3,
             eps=1e-9,
             betas=(0.9, 0.98),
-            weight_decay=0,
-            #weight_decay=1e-6,
+            weight_decay=1e-6
         )
 
     def _step(self, batch, _, step_type):
@@ -65,7 +64,7 @@ class CTCTModule(LightningModule):
         probs = self.log_softmax(layer).transpose(0, 1)
 
         loss = self.loss(probs, batch.targets, src_lengths, batch.target_lengths)
-        self.log(f"Losses/{step_type}_loss", loss, on_step=True, on_epoch=True)
+        self.log(f"Losses/{step_type}_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
 
         return loss
 
@@ -90,17 +89,25 @@ class CTCTModule(LightningModule):
         return results[0] if len(results) == 1 else results
 
     def configure_optimizers(self):
+        if self.trainer is not None:
+            total_steps = self.trainer.estimated_stepping_batches
+        else:
+            total_steps = 10000
+
         self.warmup_lr_scheduler = WarmupCosineScheduler(
             self.optimizer,
-            10,
-            self.args.epochs,
-            len(self.trainer.datamodule.train_dataloader()) / self.trainer.num_devices / self.trainer.num_nodes,
+            warmup_epochs=10,
+            total_epochs=self.args.epochs,
+            steps_per_epoch=total_steps // self.args.epochs,
         )
-        self.lr_scheduler_interval = "step"
-        return (
-            [self.optimizer],
-            [{"scheduler": self.warmup_lr_scheduler, "interval": self.lr_scheduler_interval}],
-        )
+
+        return {
+            "optimizer": self.optimizer,
+            "lr_scheduler": {
+                "scheduler": self.warmup_lr_scheduler,
+                "interval": "step",
+            }
+        }
 
     def training_step(self, batch, batch_idx):
         loss = self._step(batch, batch_idx, "train")
