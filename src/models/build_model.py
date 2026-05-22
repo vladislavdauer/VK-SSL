@@ -64,7 +64,7 @@ def conformer_rnnt_base() -> RNNT:
         conformer_ffn_dim=1024,
         conformer_num_layers=16,
         conformer_num_heads=4,
-        conformer_depthwise_conv_kernel_size=32,
+        conformer_depthwise_conv_kernel_size=31,
         conformer_dropout=0.1,
         num_symbols=1024,
         symbol_embedding_dim=256,
