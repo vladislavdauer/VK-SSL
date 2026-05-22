@@ -54,7 +54,7 @@ class CTCTModule(LightningModule):
             return None
 
         features = batch.inputs
-        output, src_lengths = self.encoder.transcribe(features, batch.input_lengths)
+        output, src_lengths = self.encoder(features, batch.input_lengths)
 
         layer = self.ctc_out(output)
         probs = self.log_softmax(layer).transpose(0, 1)
@@ -66,7 +66,7 @@ class CTCTModule(LightningModule):
 
     def forward(self, batch):
         features = batch.inputs.to(self.device)
-        encoder_out, src_lengths = self.encoder.transcribe(features, batch.input_lengths.to(self.device))
+        encoder_out, src_lengths = self.encoder(features, batch.input_lengths.to(self.device))
         logits = self.ctc_out(encoder_out)
         log_probs = self.log_softmax(logits)
 
