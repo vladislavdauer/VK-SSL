@@ -41,12 +41,11 @@ def run_eval(args):
     with torch.no_grad():
         for idx, item in enumerate(dataloader):
             if args.subset == "val":
+                batch = item
                 if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    batch = item[0]
                     y = item[1]
                     actual = sp_model.decode(y.tolist()) if hasattr(y, 'tolist') else str(y)
                 else:
-                    batch = item
                     actual = ""
             else:
                 batch, sample = item
@@ -109,4 +108,4 @@ def cli_main():
 
 
 if __name__ == "__main__":
-    main_args = cli_main()
+    cli_main()
