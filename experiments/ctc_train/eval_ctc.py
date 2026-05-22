@@ -57,12 +57,20 @@ def run_eval(args):
                     actual = ""
             else:
                 batch, sample = item
-                actual = sample
+                if isinstance(sample, (tuple, list)) and len(sample) > 2:
+                    actual = sample[2]
+                else:
+                    actual = str(sample)
 
             predicted = model(batch)
 
-            total_edit_distance += compute_word_level_distance(actual, predicted)
-            total_length += len(actual.split()) if len(actual.split()) > 0 else 1
+            if isinstance(actual, list):
+                for a, p in zip(actual, predicted if isinstance(predicted, list) else [predicted]):
+                    total_edit_distance += compute_word_level_distance(p, a)
+                    total_length += len(a.split()) if len(a.split()) > 0 else 1
+            else:
+                total_edit_distance += compute_word_level_distance(actual, predicted)
+                total_length += len(actual.split()) if len(actual.split()) > 0 else 1
 
             if idx % 100 == 0:
                 current_wer = total_edit_distance / total_length
