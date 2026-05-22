@@ -32,7 +32,11 @@ def run_eval(args):
 
     total_edit_distance = 0
     total_length = 0
-    dataloader = data_module.test_dataloader()
+
+    if args.subset == "val":
+        dataloader = data_module.val_dataloader()
+    else:
+        dataloader = data_module.test_dataloader()
 
     with torch.no_grad():
         for idx, (batch, sample) in enumerate(dataloader):
@@ -81,6 +85,13 @@ def cli_main():
         action="store_true",
         default=False,
         help="Run using CUDA.",
+    )
+    parser.add_argument(
+        "--subset",
+        type=str,
+        choices=["test", "val"],
+        default="test",
+        help="Subset to evaluate on.",
     )
     args = parser.parse_args()
     run_eval(args)
