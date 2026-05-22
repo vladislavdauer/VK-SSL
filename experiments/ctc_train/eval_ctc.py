@@ -41,15 +41,21 @@ def run_eval(args):
     with torch.no_grad():
         for idx, item in enumerate(dataloader):
             if args.subset == "val":
-                batch, sample = item if len(item) == 2 else (item[0], item[1])
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    batch = item[0]
+                    y = item[1]
+                    actual = sp_model.decode(y.tolist()) if hasattr(y, 'tolist') else str(y)
+                else:
+                    batch = item
+                    actual = ""
             else:
                 batch, sample = item
+                actual = sample
 
-            actual = sample[0][2] if isinstance(sample, list) and isinstance(sample[0], (list, tuple)) else sample
             predicted = model(batch)
 
             total_edit_distance += compute_word_level_distance(actual, predicted)
-            total_length += len(actual.split())
+            total_length += len(actual.split()) if len(actual.split()) > 0 else 1
 
             if idx % 100 == 0:
                 current_wer = total_edit_distance / total_length
@@ -103,4 +109,4 @@ def cli_main():
 
 
 if __name__ == "__main__":
-    cli_main()
+    main_args = cli_main()
