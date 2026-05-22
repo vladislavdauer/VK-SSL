@@ -39,8 +39,13 @@ def run_eval(args):
         dataloader = data_module.test_dataloader()
 
     with torch.no_grad():
-        for idx, (batch, sample) in enumerate(dataloader):
-            actual = sample[0][2]
+        for idx, item in enumerate(dataloader):
+            if args.subset == "val":
+                batch, sample = item if len(item) == 2 else (item[0], item[1])
+            else:
+                batch, sample = item
+
+            actual = sample[0][2] if isinstance(sample, list) and isinstance(sample[0], (list, tuple)) else sample
             predicted = model(batch)
 
             total_edit_distance += compute_word_level_distance(actual, predicted)
