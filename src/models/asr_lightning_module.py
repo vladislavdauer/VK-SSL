@@ -39,7 +39,7 @@ class CTCTModule(LightningModule):
         self.ctc_out = torch.nn.Linear(self.encoder.output_dim , spm_vocab_size + 1)
         self.log_softmax = torch.nn.LogSoftmax(dim=-1)
 
-        self.loss = torch.nn.CTCLoss(blank=self.blank_idx, reduction="mean")
+        self.loss = torch.nn.CTCLoss(blank=self.blank_idx, reduction="sum")
 
         self.optimizer = torch.optim.AdamW(
             itertools.chain(*([self.encoder.parameters(), self.ctc_out.parameters()])),
