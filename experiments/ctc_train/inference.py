@@ -102,14 +102,14 @@ def run_inference(args):
             logger.info(
                 f"Processed elem {idx}; "
                 f"WER: {total_edit_distance / total_length}, "
-                f"Oracle WER: {oracle_edit_distance / total_length}, ",
-                f"decoding time for batch size {args.batch_size}: {duration}",
+                f"Oracle WER: {oracle_edit_distance / total_length}, "
+                f"decoding time for batch size {args.batch_size}: {duration}"
             )
 
     logger.info(
-        f"Final WER: {total_edit_distance / total_length}, ",
-        f"Oracle WER: {oracle_edit_distance / total_length}, ",
-        f"time for decoding {decoding_duration} [sec].",
+        f"Final WER: {total_edit_distance / total_length}, "
+        f"Oracle WER: {oracle_edit_distance / total_length}, "
+        f"time for decoding {decoding_duration} [sec]."
     )
 
 
