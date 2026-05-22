@@ -10,6 +10,7 @@ import torchaudio
 from src.models.asr_lightning_module import CTCTModule
 from src.data.librispeech_data_module import get_data_module
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
 
