@@ -11,7 +11,6 @@ import torchaudio
 from pytorch_lightning import LightningModule
 
 from src.models.build_model import conformer_rnnt_base
-from src.models.audio_resnet import audio_resnet
 from src.opt.schedulers import WarmupCosineScheduler
 from src.models.rnnt_decoder import Hypothesis, RNNTBeamSearch
 
@@ -22,6 +21,7 @@ Batch = namedtuple("Batch", ["inputs", "input_lengths", "targets", "target_lengt
 class CTCTModule(LightningModule):
     def __init__(self, args=None, sp_model=None, pretrained_model_path=None):
         super().__init__()
+        self.warmup_lr_scheduler = None
         self.save_hyperparameters(args)
         self.args = args
         self.sp_model = sp_model
@@ -29,9 +29,7 @@ class CTCTModule(LightningModule):
 
         # Поменять assert
         assert spm_vocab_size == _expected_spm_vocab_size, (
-            "The model returned by conformer_rnnt_base expects a SentencePiece model of "
-            f"vocabulary size {_expected_spm_vocab_size}, but the given SentencePiece model has a vocabulary size "
-            f"of {spm_vocab_size}. Please provide a correctly configured SentencePiece model."
+            "Will be a message"
         )
         self.blank_idx = spm_vocab_size
 
@@ -56,9 +54,7 @@ class CTCTModule(LightningModule):
             return None
 
         features = batch.inputs
-        output, src_lengths = self.encoder(
-            features, batch.input_lengths
-        )
+        output, src_lengths = self.encoder.transcribe(features, batch.input_lengths)
 
         layer = self.ctc_out(output)
         probs = self.log_softmax(layer).transpose(0, 1)
@@ -70,7 +66,7 @@ class CTCTModule(LightningModule):
 
     def forward(self, batch):
         features = batch.inputs.to(self.device)
-        encoder_out, src_lengths = self.encoder(features, batch.input_lengths.to(self.device))
+        encoder_out, src_lengths = self.encoder.transcribe(features, batch.input_lengths.to(self.device))
         logits = self.ctc_out(encoder_out)
         log_probs = self.log_softmax(logits)
 
