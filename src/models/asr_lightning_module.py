@@ -45,7 +45,7 @@ class CTCTModule(LightningModule):
 
         self.optimizer = torch.optim.AdamW(
             itertools.chain(*([self.encoder.parameters(), self.ctc_out.parameters()])),
-            lr=1e-3,
+            lr=1e-2,
             weight_decay=0.0,
             betas=(0.9, 0.98),
         )
