@@ -15,7 +15,9 @@ logger = logging.getLogger()
 
 
 def compute_word_level_distance(seq1, seq2):
-    return torchaudio.functional.edit_distance(seq1.lower().split(), seq2.lower().split())
+    s1 = seq1[0] if isinstance(seq1, list) else seq1
+    s2 = seq2[0] if isinstance(seq2, list) else seq2
+    return torchaudio.functional.edit_distance(str(s1).lower().split(), str(s2).lower().split())
 
 
 def run_eval(args):
@@ -33,14 +35,17 @@ def run_eval(args):
     total_edit_distance = 0
     total_length = 0
 
-    if args.subset == "val":
+    if args.sanity_check:
         dataloader = data_module.val_dataloader()
     else:
         dataloader = data_module.test_dataloader()
 
     with torch.no_grad():
         for idx, item in enumerate(dataloader):
-            if args.subset == "val":
+            if args.sanity_check and idx >= 50:
+                break
+
+            if args.sanity_check:
                 batch = item
                 if hasattr(batch, 'targets') and batch.targets is not None:
                     target_tokens = batch.targets.cpu().tolist()
@@ -67,16 +72,16 @@ def run_eval(args):
             if isinstance(actual, list):
                 for a, p in zip(actual, predicted if isinstance(predicted, list) else [predicted]):
                     total_edit_distance += compute_word_level_distance(p, a)
-                    total_length += len(a.split()) if len(a.split()) > 0 else 1
+                    total_length += len(str(a).split()) if len(str(a).split()) > 0 else 1
             else:
                 total_edit_distance += compute_word_level_distance(actual, predicted)
-                total_length += len(actual.split()) if len(actual.split()) > 0 else 1
+                total_length += len(str(actual).split()) if len(str(actual).split()) > 0 else 1
 
-            if idx % 100 == 0:
-                current_wer = total_edit_distance / total_length
+            if idx % 10 == 0:
+                current_wer = total_edit_distance / total_length if total_length > 0 else 0.0
                 logger.info(f"Processed elem {idx}; Current WER: {current_wer:.4f}")
 
-    final_wer = total_edit_distance / total_length
+    final_wer = total_edit_distance / total_length if total_length > 0 else 0.0
     logger.info(f"Final WER: {final_wer:.4f}")
 
 
@@ -113,11 +118,10 @@ def cli_main():
         help="Run using CUDA.",
     )
     parser.add_argument(
-        "--subset",
-        type=str,
-        choices=["test", "val"],
-        default="test",
-        help="Subset to evaluate on.",
+        "--sanity_check",
+        action="store_true",
+        default=False,
+        help="Run sanity check with 50 batches.",
     )
     args = parser.parse_args()
     run_eval(args)

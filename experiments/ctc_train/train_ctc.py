@@ -51,7 +51,7 @@ def run_train(args):
             ),
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=1,
-        gradient_clip_val=5.0,  # Для CTC меньше значение
+        gradient_clip_val=5.0,
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
     )
