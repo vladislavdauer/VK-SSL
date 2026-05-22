@@ -60,7 +60,7 @@ class CTCTModule(LightningModule):
         probs = self.log_softmax(layer).transpose(0, 1)
 
         loss = self.loss(probs, batch.targets, src_lengths, batch.target_lengths)
-        self.log(f"Losses/{step_type}_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log(f"Losses/{step_type}_loss", loss, on_step=True, on_epoch=True)
 
         return loss
 
