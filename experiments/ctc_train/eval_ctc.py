@@ -42,9 +42,17 @@ def run_eval(args):
         for idx, item in enumerate(dataloader):
             if args.subset == "val":
                 batch = item
-                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    y = item[1]
-                    actual = sp_model.decode(y.tolist()) if hasattr(y, 'tolist') else str(y)
+                if hasattr(batch, 'targets') and batch.targets is not None:
+                    target_tokens = batch.targets.cpu().tolist()
+                    actual = []
+                    for tokens in target_tokens:
+                        filtered = [t for t in tokens if t not in [0, 1, 2, 3]]
+                        if filtered:
+                            actual.append(sp_model.decode(filtered))
+                        else:
+                            actual.append("")
+                    if len(actual) == 1:
+                        actual = actual[0]
                 else:
                     actual = ""
             else:
