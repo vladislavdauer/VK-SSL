@@ -10,7 +10,7 @@ import torch
 import torchaudio
 from pytorch_lightning import LightningModule
 
-from src.models.build_model import conformer_rnnt_base
+from src.models.build_model import conformer_rnnt_base, conformer_v2_ctc_base
 from src.opt.schedulers import WarmupCosineScheduler
 from src.models.rnnt_decoder import Hypothesis, RNNTBeamSearch
 
@@ -27,14 +27,13 @@ class CTCTModule(LightningModule):
         self.sp_model = sp_model
         spm_vocab_size = self.sp_model.get_piece_size()
 
-        # Поменять assert
         assert spm_vocab_size == _expected_spm_vocab_size, (
-            "Will be a message"
+            "SPM vocab size must be equal to expected vocab size"
         )
         self.blank_idx = spm_vocab_size
 
         self.frontend = None
-        self.encoder = conformer_rnnt_base().transcriber
+        self.encoder = conformer_v2_ctc_base()
 
         self.ctc_out = torch.nn.Linear(self.encoder.output_dim , spm_vocab_size + 1)
         self.log_softmax = torch.nn.LogSoftmax(dim=-1)
