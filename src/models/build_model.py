@@ -47,6 +47,8 @@ class _ConformerV2EncoderWrapper(torch.nn.Module):
             activation_checkpointing=False,
         )
 
+        self.encoder.pre_encode = None
+
         for layer in self.encoder.layers:
             if hasattr(layer.self_attn, "torch_sdpa_attn"):
                 layer.self_attn.torch_sdpa_attn = False
