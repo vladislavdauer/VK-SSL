@@ -1,6 +1,6 @@
 import torch
 
-from src.models.rnnt import _ConformerEncoder, RNNT, _Predictor, _Joiner
+from src.models.rnnt import _ConformerEncoder, RNNT, _Predictor, _Joiner, _TimeReduction
 from src.models.conformer_v2 import ConformerEncoder as ConformerEncoderV2
 
 
