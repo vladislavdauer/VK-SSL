@@ -1,32 +1,51 @@
 # VK-SSL
 
+## Окружение
+```shell
+
+git checkout preparing_backbone
+
 python3 -m venv .venv
 source .venv/bin/activate
+
 pip install -r requirements.txt
-pip install -e .
-<!-- deactivate -->
+pip install -e
+pip install torchaudio==2.4.0
+pip uninstall torchvision -y
+```
 
-### Скачать dev-clean для sanity check
-cd experiments/rnnt_train 
+## Dev-clean
+```shell
+
+cd experiments/ctc_train 
 python3 download_dev_subset_libri.py
-### Ну или сказать через впн и отдельно положить в *tar.gz
-tar -xzf librispeech/dev-clean.tar.gz -C librispeech
+```
 
-### Столкнулся с проблемами использования ffmpeg в torchaudio на mac
-### Либо понизить версию pip install torchaudio==2.4.0
-### Тут либо можно через docker попробовать, команда будет выглядеть примерно так (но пока не проверил, т.к. torchaudio==2.4.0 уже работает)
-docker run --rm -it \
-  -v $(pwd)/experiments/rnnt_train/librispeech:/app/experiments/rnnt_train/librispeech \
-  librispeech-sanity
+## Токенизатор
+```shell
 
-### Обучим токенизатор (например во время сейнити)
-python train_spm.py --librispeech-path ./datasets --sanity_check
+cd experiments/ctc_train
+python3 train_spm.py \
+    --librispeech-path ./librispeech \
+    --output-file ./librispeech/spm_unigram_1023.model
+```
 
-### Проводим sanity
-PYTORCH_ENABLE_MPS_FALLBACK=1 rnnt_train % python3 train_rnnt.py --exp-dir ./librispeech/logs/ --librispeech-path ./librispeech/ --global-stats-path ./global_stats.json --sp-model-path ./librispeech/spm_unigram_1023.model --epochs 1 --sanity_check
+## Обучение
+```shell
 
-### Смотрим логи в tb
+cd experiments/ctc_train 
+PYTHONPATH=/home/vladislavdauer/PycharmProjects/VK-SSL python3 train_ctc.py \
+    --exp-dir ./librispeech/logs \
+    --librispeech-path ./librispeech \
+    --global-stats-path ./global_stats.json \
+    --sp-model-path ./librispeech/spm_unigram_1023.model \
+    --sanity_check \
+    --epochs 100
+```
+
+## TenserBoard
+```shell
+
+cd experiments/ctc_train 
 tensorboard --logdir=./librispeech/logs/lightning_logs
-
-### Получаем чекпоинт на выходе
-VK-SSL/experiments/rnnt_train/librispeech/logs/checkpoints/epoch=0-step=50-v1.ckpt
+```
