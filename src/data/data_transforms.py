@@ -56,7 +56,7 @@ def _extract_labels(sp_model, samples: List):
     targets = torch.nn.utils.rnn.pad_sequence(
         [torch.tensor(elem) for elem in targets],
         batch_first=True,
-        padding_value=1.0,
+        padding_value=1,
     ).to(dtype=torch.int32)
     return targets, lengths
 

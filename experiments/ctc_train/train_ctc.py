@@ -51,7 +51,7 @@ def run_train(args):
             ),
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=1,
-        gradient_clip_val=5.0,
+        gradient_clip_val=1.0,
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
     )
@@ -107,7 +107,7 @@ def cli_main():
     )
     parser.add_argument(
         "--gpus",
-        default=2,
+        default=1,
         type=int,
         help="Number of GPUs per node to use for training. (Default: 2)",
     )
