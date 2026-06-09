@@ -31,6 +31,11 @@ def run_eval(args):
     if args.use_cuda:
         model = model.to(device="cuda")
 
+    if args.sanity_check:
+        model.train()
+    else:
+        model.eval()
+
     total_edit_distance = 0
     total_length = 0
 
@@ -46,39 +51,34 @@ def run_eval(args):
 
             if args.sanity_check:
                 batch = item
-                if hasattr(batch, 'targets') and batch.targets is not None:
-                    target_tokens = batch.targets.cpu().tolist()
-                    actual = []
-                    for tokens in target_tokens:
-                        filtered = [t for t in tokens if t not in [0, 1, 2, 3]]
-                        if filtered:
-                            actual.append(sp_model.decode(filtered))
-                        else:
-                            actual.append("")
-                    if len(actual) == 1:
-                        actual = actual[0]
-                else:
-                    actual = ""
+
+                actual = []
+                for tokens, length in zip(batch.targets, batch.target_lengths):
+                    length = int(length.item())
+                    target_ids = tokens[:length].detach().cpu().tolist()
+                    actual.append(sp_model.decode(target_ids))
             else:
                 batch, sample = item
+
                 if isinstance(sample, (tuple, list)) and len(sample) > 2:
-                    actual = sample[2]
+                    actual = [sample[2]]
                 else:
-                    actual = str(sample)
+                    actual = [str(sample)]
 
             predicted = model(batch)
 
-            if isinstance(actual, list):
-                for a, p in zip(actual, predicted if isinstance(predicted, list) else [predicted]):
-                    total_edit_distance += compute_word_level_distance(p, a)
-                    total_length += len(a.split()) if len(a.split()) > 0 else 1
-            else:
-                total_edit_distance += compute_word_level_distance(actual, predicted)
-                total_length += len(actual.split()) if len(actual.split()) > 0 else 1
+            if isinstance(predicted, str):
+                predicted = [predicted]
 
-            if idx % 10 == 0:
-                current_wer = total_edit_distance / total_length if total_length > 0 else 0.0
-                logger.info(f"Processed elem {idx}; Current WER: {current_wer:.4f}")
+            print("ACTUAL   :", actual)
+            print("PREDICTED:", predicted)
+
+            for a, p in zip(actual, predicted):
+                total_edit_distance += compute_word_level_distance(p, a)
+                total_length += max(len(a.split()), 1)
+
+            current_wer = total_edit_distance / max(total_length, 1)
+            logger.info(f"Processed elem {idx}; Current WER: {current_wer:.4f}")
 
     final_wer = total_edit_distance / total_length if total_length > 0 else 0.0
     logger.info(f"Final WER: {final_wer:.4f}")
