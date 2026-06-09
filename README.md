@@ -43,6 +43,19 @@ PYTHONPATH=/home/vladislavdauer/PycharmProjects/VK-SSL python3 train_ctc.py \
     --epochs 100
 ```
 
+## WER
+```shell
+
+cd experiments/ctc_train 
+PYTHONPATH=/home/vladislavdauer/PycharmProjects/VK-SSL python3 -W ignore eval_ctc.py \
+    --checkpoint-path ./librispeech/logs/checkpoints/epoch=27-step=1400.ckpt \
+    --librispeech-path ./librispeech \
+    --sp-model-path ./librispeech/spm_unigram_1023.model \
+    --global-stats-path ./global_stats.json \
+    --use-cuda \
+    --sanity_check
+```
+
 ## TenserBoard
 ```shell
 
