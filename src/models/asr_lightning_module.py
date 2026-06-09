@@ -13,10 +13,12 @@ from pytorch_lightning import LightningModule
 from src.models.build_model import conformer_rnnt_base, conformer_v2_ctc_base
 from src.opt.schedulers import WarmupCosineScheduler
 from src.models.rnnt_decoder import Hypothesis, RNNTBeamSearch
+from torchmetrics.text import WordErrorRate
 
 _expected_spm_vocab_size = 1023
 
 Batch = namedtuple("Batch", ["inputs", "input_lengths", "targets", "target_lengths"])
+
 
 class CTCTModule(LightningModule):
     def __init__(self, args=None, sp_model=None, pretrained_model_path=None):
@@ -28,25 +30,31 @@ class CTCTModule(LightningModule):
         spm_vocab_size = self.sp_model.get_piece_size()
 
         assert spm_vocab_size == _expected_spm_vocab_size, (
-            "SPM vocab size must be equal to expected vocab size"
+            f"SPM vocab size ({spm_vocab_size}) must be equal to expected vocab size ({_expected_spm_vocab_size})"
         )
         self.blank_idx = spm_vocab_size
 
         self.frontend = None
         self.encoder = conformer_v2_ctc_base()
 
-        self.ctc_out = torch.nn.Linear(self.encoder.output_dim , spm_vocab_size + 1)
+        self.ctc_out = torch.nn.Linear(self.encoder.output_dim, spm_vocab_size + 1)
+        torch.nn.init.xavier_uniform_(self.ctc_out.weight)
+        torch.nn.init.constant_(self.ctc_out.bias, 0.0)
+
         self.log_softmax = torch.nn.LogSoftmax(dim=-1)
 
-        self.loss = torch.nn.CTCLoss(blank=self.blank_idx, reduction="sum")
+        self.loss = torch.nn.CTCLoss(blank=self.blank_idx, reduction="none", zero_infinity=True, )
 
         self.optimizer = torch.optim.AdamW(
             itertools.chain(*([self.encoder.parameters(), self.ctc_out.parameters()])),
-            lr=3e-3,
+            lr=1e-4,
             eps=1e-9,
             betas=(0.9, 0.98),
             weight_decay=1e-6
         )
+
+        self.val_wer = WordErrorRate()
+        self.test_wer = WordErrorRate()
 
     def _step(self, batch, _, step_type):
         if batch is None:
@@ -58,8 +66,67 @@ class CTCTModule(LightningModule):
         layer = self.ctc_out(output)
         probs = self.log_softmax(layer).transpose(0, 1)
 
-        loss = self.loss(probs, batch.targets, src_lengths, batch.target_lengths)
-        self.log(f"Losses/{step_type}_loss", loss, on_step=True, on_epoch=True)
+        loss = self.loss(
+            probs,
+            batch.targets,
+            src_lengths,
+            batch.target_lengths,
+        ).mean()
+
+        self.log(f"Losses/{step_type}_loss", loss, on_epoch=True)
+
+        if step_type in ("val", "test"):
+            with torch.no_grad():
+                pred_ids = probs.transpose(0, 1).argmax(dim=-1)
+
+                pred_texts = []
+                target_texts = []
+
+                for i in range(pred_ids.size(0)):
+                    src_len = int(src_lengths[i].item())
+                    seq = pred_ids[i, :src_len]
+
+                    collapsed = []
+                    prev = self.blank_idx
+
+                    for idx in seq:
+                        idx = int(idx.item())
+
+                        if idx != prev and idx != self.blank_idx:
+                            collapsed.append(idx)
+
+                        prev = idx
+
+                    pred_texts.append(self.sp_model.decode(collapsed))
+
+                    target_len = int(batch.target_lengths[i].item())
+                    target_ids = (
+                        batch.targets[i, :target_len]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    target_texts.append(self.sp_model.decode(target_ids))
+
+                if step_type == "val":
+                    self.val_wer.update(pred_texts, target_texts)
+                    self.log(
+                        "Metrics/val_wer",
+                        self.val_wer,
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=True,
+                    )
+
+                if step_type == "test":
+                    self.test_wer.update(pred_texts, target_texts)
+                    self.log(
+                        "Metrics/test_wer",
+                        self.test_wer,
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=True,
+                    )
 
         return loss
 
@@ -72,13 +139,18 @@ class CTCTModule(LightningModule):
         predicted_ids = torch.argmax(log_probs, dim=-1)
 
         results = []
-        for seq in predicted_ids:
+        for seq, length in zip(predicted_ids, src_lengths):
+            seq = seq[:length]
+
             collapsed = []
             prev = self.blank_idx
+
             for idx in seq:
+                idx = idx.item()
                 if idx != prev and idx != self.blank_idx:
-                    collapsed.append(idx.item())
+                    collapsed.append(idx)
                 prev = idx
+
             results.append(self.sp_model.decode(collapsed))
 
         return results[0] if len(results) == 1 else results
@@ -104,13 +176,55 @@ class CTCTModule(LightningModule):
             }
         }
 
+    def on_before_optimizer_step(self, optimizer):
+        encoder_grad_norm = torch.zeros((), device=self.device)
+        head_grad_norm = torch.zeros((), device=self.device)
+
+        for parameter in self.encoder.parameters():
+            if parameter.grad is not None:
+                encoder_grad_norm += parameter.grad.detach().float().pow(2).sum()
+
+        for parameter in self.ctc_out.parameters():
+            if parameter.grad is not None:
+                head_grad_norm += parameter.grad.detach().float().pow(2).sum()
+
+        self.log(
+            "Norms/encoder_grad_norm",
+            encoder_grad_norm.sqrt(),
+            on_step=True,
+            on_epoch=False,
+        )
+        self.log(
+            "Norms/head_grad_norm",
+            head_grad_norm.sqrt(),
+            on_step=True,
+            on_epoch=False,
+        )
+
     def training_step(self, batch, batch_idx):
         loss = self._step(batch, batch_idx, "train")
-        batch_size = batch.inputs.size(0)
-        batch_sizes = self.all_gather(batch_size)
 
-        if isinstance(batch_sizes, torch.Tensor) and batch_sizes.dim() > 0:
-            loss *= batch_sizes.size(0) / batch_sizes.sum()
+        encoder_weight_norm = torch.zeros((), device=self.device)
+        head_weight_norm = torch.zeros((), device=self.device)
+
+        for parameter in self.encoder.parameters():
+            encoder_weight_norm += parameter.detach().float().pow(2).sum()
+
+        for parameter in self.ctc_out.parameters():
+            head_weight_norm += parameter.detach().float().pow(2).sum()
+
+        self.log(
+            "Norms/encoder_weight_norm",
+            encoder_weight_norm.sqrt(),
+            on_step=True,
+            on_epoch=False,
+        )
+        self.log(
+            "Norms/head_weight_norm",
+            head_weight_norm.sqrt(),
+            on_step=True,
+            on_epoch=False,
+        )
 
         self.log("monitoring_step", torch.tensor(self.global_step, dtype=torch.float32))
 
@@ -122,8 +236,9 @@ class CTCTModule(LightningModule):
     def test_step(self, batch, batch_idx):
         return self._step(batch, batch_idx, "test")
 
+
 def post_process_hypos(
-    hypos: List[Hypothesis], sp_model: spm.SentencePieceProcessor
+        hypos: List[Hypothesis], sp_model: spm.SentencePieceProcessor
 ) -> List[Tuple[str, float, List[int], List[int]]]:
     tokens_idx = 0
     score_idx = 3
@@ -143,8 +258,9 @@ def post_process_hypos(
 
     return nbest_batch
 
+
 class ConformerRNNTModule(LightningModule):
-    
+
     def __init__(self, args=None, sp_model=None, pretrained_model_path=None):
         super().__init__()
         self.save_hyperparameters(args)
@@ -158,7 +274,7 @@ class ConformerRNNTModule(LightningModule):
         )
         self.blank_idx = spm_vocab_size
 
-        self.frontend = None # audio_resnet()
+        self.frontend = None  # audio_resnet()
         self.model = conformer_rnnt_base()
 
         # TODO: FIXME

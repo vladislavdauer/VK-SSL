@@ -119,8 +119,8 @@ class LibriSpeechDataModule(LightningDataModule):
         max_tokens=700,
         batch_size=2,
         train_num_buckets=50,
-        train_shuffle=True,
-        num_workers=10,
+        train_shuffle=False,
+        num_workers=8,
         sanity_check=False,
     ):
         super().__init__()
