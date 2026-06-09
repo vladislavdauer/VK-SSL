@@ -54,6 +54,7 @@ def run_train(args):
         gradient_clip_val=1.0,
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
+        accumulate_grad_batches=64,
     )
 
     sp_model = spm.SentencePieceProcessor(model_file=str(args.sp_model_path))
@@ -107,7 +108,7 @@ def cli_main():
     )
     parser.add_argument(
         "--gpus",
-        default=1,
+        default=2,
         type=int,
         help="Number of GPUs per node to use for training. (Default: 2)",
     )

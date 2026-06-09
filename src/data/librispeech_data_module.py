@@ -117,9 +117,9 @@ class LibriSpeechDataModule(LightningDataModule):
         val_transform,
         test_transform,
         max_tokens=700,
-        batch_size=2,
+        batch_size=16,
         train_num_buckets=50,
-        train_shuffle=False,
+        train_shuffle=True,
         num_workers=8,
         sanity_check=False,
     ):

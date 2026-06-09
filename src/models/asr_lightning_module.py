@@ -47,12 +47,13 @@ class CTCTModule(LightningModule):
 
         self.optimizer = torch.optim.AdamW(
             itertools.chain(*([self.encoder.parameters(), self.ctc_out.parameters()])),
-            lr=1e-4,
+            lr=3e-3,
             eps=1e-9,
             betas=(0.9, 0.98),
             weight_decay=1e-6
         )
 
+        self.train_wer = WordErrorRate()
         self.val_wer = WordErrorRate()
         self.test_wer = WordErrorRate()
 
@@ -75,7 +76,7 @@ class CTCTModule(LightningModule):
 
         self.log(f"Losses/{step_type}_loss", loss, on_epoch=True)
 
-        if step_type in ("val", "test"):
+        if step_type in ("train", "val", "test"):
             with torch.no_grad():
                 pred_ids = probs.transpose(0, 1).argmax(dim=-1)
 
@@ -108,6 +109,17 @@ class CTCTModule(LightningModule):
                     )
                     target_texts.append(self.sp_model.decode(target_ids))
 
+                if step_type == "train":
+                    self.train_wer.update(pred_texts, target_texts)
+                    self.log(
+                        "Metrics/train_wer",
+                        self.train_wer,
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=True,
+                        logger=True,
+                    )
+
                 if step_type == "val":
                     self.val_wer.update(pred_texts, target_texts)
                     self.log(
@@ -116,6 +128,7 @@ class CTCTModule(LightningModule):
                         on_step=False,
                         on_epoch=True,
                         prog_bar=True,
+                        logger=True,
                     )
 
                 if step_type == "test":
@@ -126,6 +139,7 @@ class CTCTModule(LightningModule):
                         on_step=False,
                         on_epoch=True,
                         prog_bar=True,
+                        logger=True,
                     )
 
         return loss
