@@ -43,7 +43,7 @@ class CTCTModule(LightningModule):
 
         self.log_softmax = torch.nn.LogSoftmax(dim=-1)
 
-        self.loss = torch.nn.CTCLoss(blank=self.blank_idx, reduction="none", zero_infinity=True, )
+        self.loss = torch.nn.CTCLoss(blank=self.blank_idx, reduction="none", zero_infinity=True)
 
         self.optimizer = torch.optim.AdamW(
             itertools.chain(*([self.encoder.parameters(), self.ctc_out.parameters()])),

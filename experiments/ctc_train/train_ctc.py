@@ -55,6 +55,7 @@ def run_train(args):
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
         accumulate_grad_batches=64,
+        enable_progress_bar=False
     )
 
     sp_model = spm.SentencePieceProcessor(model_file=str(args.sp_model_path))
