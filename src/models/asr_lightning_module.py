@@ -38,7 +38,7 @@ class CTCTModule(LightningModule):
         self.encoder = conformer_v2_ctc_base()
 
         self.ctc_out = torch.nn.Linear(self.encoder.output_dim, spm_vocab_size + 1)
-        torch.nn.init.xavier_uniform_(self.ctc_out.weight)
+        torch.nn.init.normal_(self.ctc_out.weight, mean=0.0, std=0.01)
         torch.nn.init.constant_(self.ctc_out.bias, 0.0)
 
         self.log_softmax = torch.nn.LogSoftmax(dim=-1)
@@ -47,10 +47,10 @@ class CTCTModule(LightningModule):
 
         self.optimizer = torch.optim.AdamW(
             itertools.chain(*([self.encoder.parameters(), self.ctc_out.parameters()])),
-            lr=3e-3,
+            lr=1e-3,
             eps=1e-9,
             betas=(0.9, 0.98),
-            weight_decay=1e-6
+            weight_decay=1e-3
         )
 
         self.train_wer = WordErrorRate()
@@ -74,7 +74,7 @@ class CTCTModule(LightningModule):
             batch.target_lengths,
         ).mean()
 
-        self.log(f"Losses/{step_type}_loss", loss, on_epoch=True)
+        self.log(f"Losses/{step_type}_loss", loss, on_epoch=True, sync_dist=True)
 
         if step_type in ("train", "val", "test"):
             with torch.no_grad():

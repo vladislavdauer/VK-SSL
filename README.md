@@ -33,21 +33,25 @@ python3 train_spm.py \
 ## Обучение
 ```shell
 
+module load Python/PyTorch_GPU_v2.4
+source ~/vk-ssl-venv/bin/activate
+
 cd experiments/ctc_train 
-PYTHONPATH=/home/vladislavdauer/PycharmProjects/VK-SSL python3 train_ctc.py \
+PYTHONPATH=/home/vrdauer/VK-SSL python -m torch.distributed.run \
+    --nproc_per_node=4 train_ctc.py \
     --exp-dir ./librispeech/logs \
     --librispeech-path ./librispeech \
     --global-stats-path ./global_stats.json \
     --sp-model-path ./librispeech/spm_unigram_1023.model \
-    --sanity_check \
-    --epochs 100
+    --epochs 150 \
+    --gpus 4
 ```
 
 ## WER
 ```shell
 
 cd experiments/ctc_train 
-PYTHONPATH=/home/vladislavdauer/PycharmProjects/VK-SSL python3 -W ignore eval_ctc.py \
+PYTHONPATH=/home/vrdauer/VK-SSL python3 -W ignore eval_ctc.py \
     --checkpoint-path ./librispeech/logs/checkpoints/epoch=27-step=1400.ckpt \
     --librispeech-path ./librispeech \
     --sp-model-path ./librispeech/spm_unigram_1023.model \

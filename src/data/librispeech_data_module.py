@@ -116,8 +116,8 @@ class LibriSpeechDataModule(LightningDataModule):
         train_transform,
         val_transform,
         test_transform,
-        max_tokens=700,
-        batch_size=16,
+        max_tokens=32000,
+        batch_size=32,
         train_num_buckets=50,
         train_shuffle=True,
         num_workers=8,
@@ -136,6 +136,7 @@ class LibriSpeechDataModule(LightningDataModule):
         self.train_shuffle = train_shuffle
         self.num_workers = num_workers
         self.sanity_check = sanity_check
+
 
     def train_dataloader(self):
         if self.sanity_check:

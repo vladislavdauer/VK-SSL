@@ -11,6 +11,7 @@ from pytorch_lightning.strategies import DDPStrategy
 from src.models.asr_lightning_module import CTCTModule
 from src.data.librispeech_data_module import get_data_module
 
+
 def run_train(args):
     seed_everything(1)
     checkpoint_dir = args.exp_dir / "checkpoints"
@@ -51,11 +52,11 @@ def run_train(args):
             ),
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=1,
-        gradient_clip_val=1.0,
+        gradient_clip_val=0.5,
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
-        accumulate_grad_batches=64,
-        enable_progress_bar=False
+        accumulate_grad_batches=16,
+        enable_progress_bar=True,
     )
 
     sp_model = spm.SentencePieceProcessor(model_file=str(args.sp_model_path))
