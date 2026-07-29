@@ -354,6 +354,7 @@ class ConformerConvolution(nn.Module):
         d_model: int,
         kernel_size: int,
         norm_type: str,
+        dropout: float = 0.0,
     ):
         super().__init__()
         assert (kernel_size - 1) % 2 == 0
@@ -374,6 +375,7 @@ class ConformerConvolution(nn.Module):
             else nn.LayerNorm(d_model)
         )
         self.activation = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
         self.pointwise_conv2 = nn.Conv1d(d_model, d_model, kernel_size=1)
 
     def forward(self, x: Tensor, pad_mask: Optional[Tensor] = None) -> Tensor:
@@ -388,7 +390,9 @@ class ConformerConvolution(nn.Module):
         else:
             x = self.batch_norm(x.transpose(1, 2)).transpose(1, 2)
         x = self.activation(x)
+        x = self.dropout(x)
         x = self.pointwise_conv2(x)
+        x = self.dropout(x)
         return x.transpose(1, 2)
 
 
@@ -397,14 +401,19 @@ class ConformerFeedForward(nn.Module):
     Conformer Feed Forward module.
     """
 
-    def __init__(self, d_model: int, d_ff: int, use_bias=True):
+    def __init__(self, d_model: int, d_ff: int, use_bias=True, dropout: float = 0.0):
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_ff, bias=use_bias)
         self.activation = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(d_ff, d_model, bias=use_bias)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.linear2(self.activation(self.linear1(x)))
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        return self.dropout(x)
 
 
 class ConformerLayer(nn.Module):
@@ -424,16 +433,18 @@ class ConformerLayer(nn.Module):
         conv_norm_type: str = "batch_norm",
         conv_kernel_size: int = 31,
         flash_attn: bool = False,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.fc_factor = 0.5
         self.norm_feed_forward1 = nn.LayerNorm(d_model)
-        self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff)
+        self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
         self.norm_conv = nn.LayerNorm(d_model)
         self.conv = ConformerConvolution(
             d_model=d_model,
             kernel_size=conv_kernel_size,
             norm_type=conv_norm_type,
+            dropout=dropout,
         )
         self.norm_self_att = nn.LayerNorm(d_model)
         if self_attention_model == "rotary":
@@ -450,7 +461,8 @@ class ConformerLayer(nn.Module):
                 n_feat=d_model,
             )
         self.norm_feed_forward2 = nn.LayerNorm(d_model)
-        self.feed_forward2 = ConformerFeedForward(d_model=d_model, d_ff=d_ff)
+        self.feed_forward2 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
+        self.self_attn_dropout = nn.Dropout(dropout)
         self.norm_out = nn.LayerNorm(d_model)
 
     def forward(
@@ -467,6 +479,7 @@ class ConformerLayer(nn.Module):
 
         x = self.norm_self_att(residual)
         x = self.self_attn(x, x, x, pos_emb, mask=att_mask)
+        x = self.self_attn_dropout(x)
         residual = residual + x
 
         x = self.norm_conv(residual)
@@ -506,6 +519,7 @@ class ConformerEncoder(nn.Module):
         conv_kernel_size: int = 31,
         flash_attn: bool = False,
         activation_checkpointing: bool = False,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.feat_in = feat_in
@@ -542,6 +556,7 @@ class ConformerEncoder(nn.Module):
                 conv_norm_type=conv_norm_type,
                 conv_kernel_size=conv_kernel_size,
                 flash_attn=flash_attn,
+                dropout=dropout,
             )
             self.layers.append(layer)
 

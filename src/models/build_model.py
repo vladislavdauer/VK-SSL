@@ -45,6 +45,7 @@ class _ConformerV2EncoderWrapper(torch.nn.Module):
             conv_kernel_size=conformer_depthwise_conv_kernel_size,
             flash_attn=False,
             activation_checkpointing=False,
+            dropout=conformer_dropout,
         )
 
         self.encoder.pre_encode = None
@@ -61,8 +62,6 @@ class _ConformerV2EncoderWrapper(torch.nn.Module):
         )
 
         self.layer_norm = torch.nn.LayerNorm(output_dim)
-
-        _ = conformer_dropout
 
     def forward(self, input: torch.Tensor, lengths: torch.Tensor):
         x, lengths = self.time_reduction(input, lengths)
