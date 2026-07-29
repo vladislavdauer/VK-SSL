@@ -1,5 +1,5 @@
-torchaudio
+torch==2.4.0
+torchaudio==2.4.0
 pytorch-lightning
 sentencepiece
 tensorboard
-torch

@@ -1,6 +1,8 @@
 # VK-SSL
 
 ## Окружение
+
+### Локальное окружение
 ```shell
 
 git checkout preparing_backbone
@@ -8,10 +10,17 @@ git checkout preparing_backbone
 python3 -m venv .venv
 source .venv/bin/activate
 
-pip install -r requirements.txt
 pip install -e
-pip install torchaudio==2.4.0
+pip install -r requirements.txt
 pip uninstall torchvision -y
+```
+
+### Окружение суперкомпьютера
+
+```shell
+
+module load Python/PyTorch_GPU_v2.4
+source ~/vk-ssl-venv/bin/activate
 ```
 
 ## Dev-clean
@@ -33,9 +42,6 @@ python3 train_spm.py \
 ## Обучение
 ```shell
 
-module load Python/PyTorch_GPU_v2.4
-source ~/vk-ssl-venv/bin/activate
-
 cd experiments/ctc_train 
 PYTHONPATH=/home/vrdauer/VK-SSL python -m torch.distributed.run \
     --nproc_per_node=4 train_ctc.py \
@@ -52,12 +58,11 @@ PYTHONPATH=/home/vrdauer/VK-SSL python -m torch.distributed.run \
 
 cd experiments/ctc_train 
 PYTHONPATH=/home/vrdauer/VK-SSL python3 -W ignore eval_ctc.py \
-    --checkpoint-path ./librispeech/logs/checkpoints/epoch=27-step=1400.ckpt \
+    --checkpoint-path ./librispeech/logs/checkpoints/'checkpoint_name'.ckpt \
     --librispeech-path ./librispeech \
     --sp-model-path ./librispeech/spm_unigram_1023.model \
     --global-stats-path ./global_stats.json \
-    --use-cuda \
-    --sanity_check
+    --use-cuda 
 ```
 
 ## TenserBoard
