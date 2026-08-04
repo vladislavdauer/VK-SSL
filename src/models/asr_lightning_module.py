@@ -11,7 +11,7 @@ import torchaudio
 from pytorch_lightning import LightningModule
 
 from src.models.build_model import conformer_rnnt_base, conformer_v2_ctc_base
-from src.opt.schedulers import WarmupCosineScheduler
+from src.opt.schedulers import NoamAnnealing, WarmupCosineScheduler
 from src.models.rnnt_decoder import Hypothesis, RNNTBeamSearch
 from torchmetrics.text import WordErrorRate
 
@@ -47,7 +47,7 @@ class CTCTModule(LightningModule):
 
         self.optimizer = torch.optim.AdamW(
             itertools.chain(*([self.encoder.parameters(), self.ctc_out.parameters()])),
-            lr=3e-4,
+            lr=5.0,
             eps=1e-9,
             betas=(0.9, 0.98),
             weight_decay=1e-3
@@ -170,16 +170,11 @@ class CTCTModule(LightningModule):
         return results[0] if len(results) == 1 else results
 
     def configure_optimizers(self):
-        if self.trainer is not None:
-            total_steps = self.trainer.estimated_stepping_batches
-        else:
-            total_steps = 10000
-
-        self.warmup_lr_scheduler = WarmupCosineScheduler(
+        self.warmup_lr_scheduler = NoamAnnealing(
             self.optimizer,
-            warmup_epochs=10,
-            total_epochs=self.args.epochs,
-            steps_per_epoch=total_steps // self.args.epochs,
+            d_model=256,
+            warmup_steps=10000,
+            min_lr=1e-6,
         )
 
         return {

@@ -3,6 +3,37 @@ import math
 import torch
 
 
+class NoamAnnealing(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        d_model: int,
+        warmup_steps: int = 10000,
+        min_lr: float = 1e-6,
+        last_epoch: int = -1,
+    ):
+        self.d_model = d_model
+        self.warmup_steps = warmup_steps
+        self.min_lr = min_lr
+        self._normalize = d_model ** (-0.5)
+        super().__init__(optimizer, last_epoch=last_epoch)
+
+    def get_lr(self):
+        step = max(1, self._step_count)
+        out = []
+
+        for initial_lr in self.base_lrs:
+            mult = self._normalize * min(step ** (-0.5), step * (self.warmup_steps ** (-1.5)))
+            lr = initial_lr * mult
+
+            if step > self.warmup_steps:
+                lr = max(lr, self.min_lr)
+
+            out.append(lr)
+
+        return out
+
+
 class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
     def __init__(
         self,
