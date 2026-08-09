@@ -67,7 +67,7 @@ def eval_dataloader(model, sp_model, dataloader, subset_name, sanity_check=False
 
                 print(f"ACTUAL   : {a}")
                 print(f"PREDICTED: {p}")
-                print(f"WER      : {utt_wer:.4f}")
+                print(f"WER      : {utt_wer:.4f}\n")
 
             current_wer = total_edit_distance / max(total_length, 1)
             logger.info(f"[{subset_name}] elem {idx}; corpus WER: {current_wer:.4f}")
