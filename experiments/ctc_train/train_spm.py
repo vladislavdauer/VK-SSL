@@ -27,7 +27,7 @@ def train_spm(input):
     spm.SentencePieceTrainer.train(
         sentence_iterator=iter(input),
         model_writer=model_writer,
-        vocab_size=1023,
+        vocab_size=128,
         model_type="unigram",
         input_sentence_size=-1,
         character_coverage=1.0,

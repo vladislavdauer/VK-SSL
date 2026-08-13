@@ -52,7 +52,7 @@ def run_train(args):
             ),
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=1,
-        gradient_clip_val=0.5,
+        gradient_clip_val=0.0,
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
         accumulate_grad_batches=16,

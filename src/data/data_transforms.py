@@ -76,10 +76,13 @@ class TrainTransform:
             FunctionalModule(_piecewise_linear_log),
             GlobalStatsNormalization(global_stats_path),
             FunctionalModule(partial(torch.transpose, dim0=1, dim1=2)),
-            torchaudio.transforms.FrequencyMasking(27),
-            torchaudio.transforms.FrequencyMasking(27),
-            torchaudio.transforms.TimeMasking(100, p=0.2),
-            torchaudio.transforms.TimeMasking(100, p=0.2),
+            torchaudio.transforms.FrequencyMasking(27, iid_masks=True),
+            torchaudio.transforms.FrequencyMasking(27, iid_masks=True),
+            torchaudio.transforms.TimeMasking(10000, p=0.05, iid_masks=True),
+            torchaudio.transforms.TimeMasking(10000, p=0.05, iid_masks=True),
+            torchaudio.transforms.TimeMasking(10000, p=0.05, iid_masks=True),
+            torchaudio.transforms.TimeMasking(10000, p=0.05, iid_masks=True),
+            torchaudio.transforms.TimeMasking(10000, p=0.05, iid_masks=True),
             FunctionalModule(partial(torch.transpose, dim0=1, dim1=2)),
         )
 

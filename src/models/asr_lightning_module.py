@@ -15,7 +15,7 @@ from src.opt.schedulers import NoamAnnealing, WarmupCosineScheduler
 from src.models.rnnt_decoder import Hypothesis, RNNTBeamSearch
 from torchmetrics.text import WordErrorRate
 
-_expected_spm_vocab_size = 1023
+_expected_spm_vocab_size = 128
 
 Batch = namedtuple("Batch", ["inputs", "input_lengths", "targets", "target_lengths"])
 
@@ -114,7 +114,7 @@ class CTCTModule(LightningModule):
                     self.log(
                         "Metrics/train_wer",
                         self.train_wer,
-                        on_step=False,
+                        on_step=True,
                         on_epoch=True,
                         prog_bar=True,
                         logger=True,

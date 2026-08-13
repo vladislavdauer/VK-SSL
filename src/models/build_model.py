@@ -17,26 +17,23 @@ class _ConformerV2EncoderWrapper(torch.nn.Module):
         conformer_num_heads: int,
         conformer_depthwise_conv_kernel_size: int,
         conformer_dropout: float,
+        subsampling_factor: int = 4,
     ):
         super().__init__()
 
         assert conformer_ffn_dim % conformer_input_dim == 0
+        _ = time_reduction_stride
 
         self.output_dim = output_dim
-        self.time_reduction = _TimeReduction(time_reduction_stride)
-
-        self.input_linear = torch.nn.Linear(
-            input_dim * time_reduction_stride,
-            conformer_input_dim,
-        )
+        self.subsampling_factor = subsampling_factor
 
         self.encoder = ConformerEncoderV2(
-            feat_in=conformer_input_dim,
+            feat_in=input_dim,
             n_layers=conformer_num_layers,
             d_model=conformer_input_dim,
-            subsampling="conv1d",
+            subsampling="conv2d",
             subs_kernel_size=3,
-            subsampling_factor=2,
+            subsampling_factor=subsampling_factor,
             ff_expansion_factor=conformer_ffn_dim // conformer_input_dim,
             self_attention_model="rotary",
             n_heads=conformer_num_heads,
@@ -47,8 +44,6 @@ class _ConformerV2EncoderWrapper(torch.nn.Module):
             activation_checkpointing=False,
             dropout=conformer_dropout,
         )
-
-        self.encoder.pre_encode = None
 
         for layer in self.encoder.layers:
             if hasattr(layer.self_attn, "torch_sdpa_attn"):
@@ -64,9 +59,8 @@ class _ConformerV2EncoderWrapper(torch.nn.Module):
         self.layer_norm = torch.nn.LayerNorm(output_dim)
 
     def forward(self, input: torch.Tensor, lengths: torch.Tensor):
-        x, lengths = self.time_reduction(input, lengths)
-        x = self.input_linear(x)
-
+        lengths = lengths.to(device=input.device, dtype=torch.long)
+        x, lengths = self.encoder.pre_encode(x=input, lengths=lengths)
         lengths = lengths.to(device=x.device, dtype=torch.long)
         lengths = lengths.clamp_min(0).clamp_max(x.size(1))
 
@@ -140,6 +134,7 @@ def conformer_v2_ctc_model(
         conformer_num_heads=conformer_num_heads,
         conformer_depthwise_conv_kernel_size=conformer_depthwise_conv_kernel_size,
         conformer_dropout=conformer_dropout,
+        subsampling_factor=4,
     )
 
 
@@ -150,7 +145,7 @@ def conformer_v2_ctc_base() -> _ConformerV2EncoderWrapper:
         time_reduction_stride=4,
         conformer_input_dim=256,
         conformer_ffn_dim=1024,
-        conformer_num_layers=16,
+        conformer_num_layers=18,
         conformer_num_heads=4,
         conformer_depthwise_conv_kernel_size=31,
         conformer_dropout=0.1,
