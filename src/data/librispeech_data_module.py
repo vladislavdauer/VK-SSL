@@ -1,5 +1,6 @@
 import os
 import random
+from pathlib import Path
 
 import torch
 import torchaudio
@@ -7,21 +8,28 @@ from pytorch_lightning import LightningDataModule
 
 from src.data.data_transforms import (
     TrainTransform, ValTransform, TestTransform
-    )
+)
+from src.data.duration_cache import load_durations
 
 
-def _batch_by_token_count(idx_target_lengths, max_tokens, batch_size=None):
+def _batch_by_length(idx_lengths, batch_size, max_batch_duration=None):
     batches = []
     current_batch = []
-    current_token_count = 0
-    for idx, target_length in idx_target_lengths:
-        if current_token_count + target_length > max_tokens or (batch_size and len(current_batch) == batch_size):
+    current_duration = 0.0
+    for idx, duration in idx_lengths:
+        would_exceed_duration = (
+            max_batch_duration is not None
+            and current_batch
+            and current_duration + duration > max_batch_duration
+        )
+        would_exceed_count = batch_size is not None and len(current_batch) == batch_size
+        if would_exceed_duration or would_exceed_count:
             batches.append(current_batch)
             current_batch = [idx]
-            current_token_count = target_length
+            current_duration = duration
         else:
             current_batch.append(idx)
-            current_token_count += target_length
+            current_duration += duration
 
     if current_batch:
         batches.append(current_batch)
@@ -29,24 +37,20 @@ def _batch_by_token_count(idx_target_lengths, max_tokens, batch_size=None):
     return batches
 
 
-def get_sample_lengths(librispeech_dataset):
-    fileid_to_target_length = {}
-
-    def _target_length(fileid):
-        if fileid not in fileid_to_target_length:
-            speaker_id, chapter_id, _ = fileid.split("-")
-
-            file_text = speaker_id + "-" + chapter_id + librispeech_dataset._ext_txt
-            file_text = os.path.join(librispeech_dataset._path, speaker_id, chapter_id, file_text)
-
-            with open(file_text) as ft:
-                for line in ft:
-                    fileid_text, transcript = line.strip().split(" ", 1)
-                    fileid_to_target_length[fileid_text] = len(transcript)
-
-        return fileid_to_target_length[fileid]
-
-    return [_target_length(fileid) for fileid in librispeech_dataset._walker]
+def filter_by_duration(dataset, durations, min_duration, max_duration):
+    keep_idx = [
+        i
+        for i, dur in enumerate(durations)
+        if min_duration <= dur <= max_duration
+    ]
+    if not keep_idx:
+        raise RuntimeError(
+            f"No samples left after duration filter "
+            f"[{min_duration}, {max_duration}] s "
+            f"(had {len(durations)} samples)."
+        )
+    filtered_durations = [durations[i] for i in keep_idx]
+    return torch.utils.data.Subset(dataset, keep_idx), filtered_durations
 
 
 class CustomBucketDataset(torch.utils.data.Dataset):
@@ -54,10 +58,10 @@ class CustomBucketDataset(torch.utils.data.Dataset):
         self,
         dataset,
         lengths,
-        max_tokens,
         num_buckets,
         shuffle=False,
         batch_size=None,
+        max_batch_duration=None,
     ):
         super().__init__()
 
@@ -68,23 +72,29 @@ class CustomBucketDataset(torch.utils.data.Dataset):
         max_length = max(lengths)
         min_length = min(lengths)
 
-        assert max_tokens >= max_length
+        if max_batch_duration is not None:
+            assert max_batch_duration >= max_length
 
-        buckets = torch.linspace(min_length, max_length, num_buckets)
-        lengths = torch.tensor(lengths)
-        bucket_assignments = torch.bucketize(lengths, buckets)
+        if num_buckets <= 1 or max_length == min_length:
+            bucket_assignments = torch.zeros(len(lengths), dtype=torch.long)
+        else:
+            buckets = torch.linspace(min_length, max_length, num_buckets)
+            bucket_assignments = torch.bucketize(torch.tensor(lengths), buckets)
 
-        idx_length_buckets = [(idx, length, bucket_assignments[idx]) for idx, length in enumerate(lengths)]
+        idx_length_buckets = [
+            (idx, length, int(bucket_assignments[idx]))
+            for idx, length in enumerate(lengths)
+        ]
         if shuffle:
             idx_length_buckets = random.sample(idx_length_buckets, len(idx_length_buckets))
         else:
             idx_length_buckets = sorted(idx_length_buckets, key=lambda x: x[1], reverse=True)
 
         sorted_idx_length_buckets = sorted(idx_length_buckets, key=lambda x: x[2])
-        self.batches = _batch_by_token_count(
+        self.batches = _batch_by_length(
             [(idx, length) for idx, length, _ in sorted_idx_length_buckets],
-            max_tokens,
             batch_size=batch_size,
+            max_batch_duration=max_batch_duration,
         )
 
     def __getitem__(self, idx):
@@ -116,93 +126,117 @@ class LibriSpeechDataModule(LightningDataModule):
         train_transform,
         val_transform,
         test_transform,
-        max_tokens=32000,
-        batch_size=32,
+        batch_size=16,
+        min_duration=0.1,
+        max_duration=16.7,
+        max_batch_duration=None,
         train_num_buckets=50,
         train_shuffle=True,
-        num_workers=8,
+        num_workers=4,
+        durations_cache_dir=None,
         sanity_check=False,
     ):
         super().__init__()
         self.librispeech_path = librispeech_path
-        self.train_dataset_lengths = None
-        self.val_dataset_lengths = None
+        self.durations_cache_dir = Path(
+            durations_cache_dir
+            if durations_cache_dir is not None
+            else Path(librispeech_path) / ".duration_cache"
+        )
+        self.train_dataset_durations = None
+        self.val_dataset_durations = None
         self.train_transform = train_transform
         self.val_transform = val_transform
         self.test_transform = test_transform
-        self.max_tokens = max_tokens
         self.batch_size = batch_size
+        self.min_duration = min_duration
+        self.max_duration = max_duration
+        self.max_batch_duration = max_batch_duration
         self.train_num_buckets = train_num_buckets
         self.train_shuffle = train_shuffle
         self.num_workers = num_workers
         self.sanity_check = sanity_check
 
+    def _prepare_datasets(self, urls, durations_cache_attr, num_buckets):
+        datasets = [
+            self.librispeech_cls(self.librispeech_path, url=url) for url in urls
+        ]
+
+        cached = getattr(self, durations_cache_attr)
+        if not cached:
+            cached = []
+            for url, dataset in zip(urls, datasets):
+                durations = load_durations(
+                    self.durations_cache_dir,
+                    url,
+                    expected_n=len(dataset._walker),
+                )
+                if int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0))) == 0:
+                    print(
+                        f"Loaded duration cache: "
+                        f"{self.durations_cache_dir / (url.replace('-', '_') + '_durations.json')} "
+                        f"({len(durations)})",
+                        flush=True,
+                    )
+                cached.append(durations)
+            setattr(self, durations_cache_attr, cached)
+
+        bucketed = []
+        for dataset, durations in zip(datasets, cached):
+            filtered_ds, filtered_durs = filter_by_duration(
+                dataset,
+                durations,
+                self.min_duration,
+                self.max_duration,
+            )
+            bucketed.append(
+                CustomBucketDataset(
+                    filtered_ds,
+                    filtered_durs,
+                    num_buckets=num_buckets,
+                    shuffle=False,
+                    batch_size=self.batch_size,
+                    max_batch_duration=self.max_batch_duration,
+                )
+            )
+        return torch.utils.data.ConcatDataset(bucketed)
 
     def train_dataloader(self):
         if self.sanity_check:
-            datasets = [
-                self.librispeech_cls(self.librispeech_path, url="dev-clean")
-            ]
+            urls = ["dev-clean"]
         else:
-            datasets = [
-                self.librispeech_cls(self.librispeech_path, url="train-clean-360"),
-                self.librispeech_cls(self.librispeech_path, url="train-clean-100"),
-                self.librispeech_cls(self.librispeech_path, url="train-other-500"),
-            ]
+            urls = ["train-clean-360", "train-clean-100", "train-other-500"]
 
-        if not self.train_dataset_lengths:
-            self.train_dataset_lengths = [get_sample_lengths(dataset) for dataset in datasets]
-
-        dataset = torch.utils.data.ConcatDataset(
-            [
-                CustomBucketDataset(
-                    dataset,
-                    lengths,
-                    self.max_tokens,
-                    self.train_num_buckets,
-                    batch_size=self.batch_size,
-                )
-                for dataset, lengths in zip(datasets, self.train_dataset_lengths)
-            ]
+        dataset = self._prepare_datasets(
+            urls,
+            "train_dataset_durations",
+            num_buckets=self.train_num_buckets,
         )
         dataset = TransformDataset(dataset, self.train_transform)
-        dataloader = torch.utils.data.DataLoader(
+        return torch.utils.data.DataLoader(
             dataset,
             num_workers=self.num_workers,
             batch_size=None,
             shuffle=self.train_shuffle,
         )
-        return dataloader
 
     def val_dataloader(self):
         if self.sanity_check:
-            datasets = [
-                self.librispeech_cls(self.librispeech_path, url="dev-clean")
-            ]
+            urls = ["dev-clean"]
         else:
-            datasets = [
-                self.librispeech_cls(self.librispeech_path, url="dev-clean"),
-                self.librispeech_cls(self.librispeech_path, url="dev-other"),
-            ]
+            urls = ["dev-clean", "dev-other"]
 
-        if not self.val_dataset_lengths:
-            self.val_dataset_lengths = [get_sample_lengths(dataset) for dataset in datasets]
-
-        dataset = torch.utils.data.ConcatDataset(
-            [
-                CustomBucketDataset(
-                    dataset,
-                    lengths,
-                    self.max_tokens,
-                    1,
-                    batch_size=self.batch_size,
-                )
-                for dataset, lengths in zip(datasets, self.val_dataset_lengths)
-            ]
+        dataset = self._prepare_datasets(
+            urls,
+            "val_dataset_durations",
+            num_buckets=1,
         )
         dataset = TransformDataset(dataset, self.val_transform)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=self.num_workers)
-        return dataloader
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=None,
+            num_workers=self.num_workers,
+        )
 
     def test_dataloader(self):
         if self.sanity_check:
@@ -210,15 +244,16 @@ class LibriSpeechDataModule(LightningDataModule):
         else:
             dataset = self.librispeech_cls(self.librispeech_path, url="test-clean")
         dataset = TransformDataset(dataset, self.test_transform)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
-        return dataloader
-    
+        return torch.utils.data.DataLoader(dataset, batch_size=None)
+
 
 def get_data_module(
-        librispeech_path, 
-        global_stats_path, 
+        librispeech_path,
+        global_stats_path,
         sp_model_path,
         sanity_check=False,
+        durations_cache_dir=None,
+        num_workers=4,
         ):
     train_transform = TrainTransform(
         global_stats_path=global_stats_path, sp_model_path=sp_model_path
@@ -235,4 +270,8 @@ def get_data_module(
         val_transform=val_transform,
         test_transform=test_transform,
         sanity_check=sanity_check,
+        durations_cache_dir=durations_cache_dir,
+        num_workers=num_workers,
+        min_duration=0.1,
+        max_duration=16.7,
     )

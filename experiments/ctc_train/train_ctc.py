@@ -6,6 +6,7 @@ import sentencepiece as spm
 import torch
 from pytorch_lightning import seed_everything, Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
 
 from src.models.asr_lightning_module import CTCTModule
@@ -37,8 +38,14 @@ def run_train(args):
         train_checkpoint,
         lr_monitor,
     ]
+    tb_logger = TensorBoardLogger(save_dir=args.exp_dir, name="lightning_logs", version=None)
+    loggers = [
+        tb_logger,
+        CSVLogger(save_dir=args.exp_dir, name="lightning_logs", version=tb_logger.version),
+    ]
     trainer = Trainer(
         default_root_dir=args.exp_dir,
+        logger=loggers,
         max_epochs=args.epochs,
         num_nodes=args.nodes,
         devices=(
@@ -51,11 +58,11 @@ def run_train(args):
             DDPStrategy(find_unused_parameters=False) if torch.cuda.is_available() else "auto"
             ),
         callbacks=callbacks,
-        reload_dataloaders_every_n_epochs=1,
+        reload_dataloaders_every_n_epochs=0,
         gradient_clip_val=0.0,
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
-        accumulate_grad_batches=16,
+        accumulate_grad_batches=32,
         enable_progress_bar=True,
     )
 
@@ -67,6 +74,10 @@ def run_train(args):
         str(args.global_stats_path),
         str(args.sp_model_path),
         sanity_check=bool(args.sanity_check),
+        durations_cache_dir=str(args.durations_cache_dir)
+        if args.durations_cache_dir
+        else None,
+        num_workers=args.num_workers,
         )
     trainer.fit(model, data_module, ckpt_path=args.checkpoint_path)
 
@@ -124,6 +135,18 @@ def cli_main():
         "--sanity_check",
         action="store_true",
         help="Run sanity check with small subset of data.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        default=4,
+        type=int,
+        help="DataLoader workers per process. Use 0-2 on slow NFS. (Default: 4)",
+    )
+    parser.add_argument(
+        "--durations-cache-dir",
+        default=None,
+        type=pathlib.Path,
+        help="JSON cache for audio durations (default: <librispeech>/.duration_cache).",
     )
     args = parser.parse_args()
     run_train(args)
