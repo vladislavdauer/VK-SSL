@@ -34,6 +34,29 @@ class NoamAnnealing(torch.optim.lr_scheduler._LRScheduler):
         return out
 
 
+class LinearWarmupDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int,
+        total_steps: int,
+        last_epoch: int = -1,
+    ):
+        self.warmup_steps = max(1, int(warmup_steps))
+        self.total_steps = max(self.warmup_steps + 1, int(total_steps))
+        super().__init__(optimizer, last_epoch=last_epoch)
+
+    def get_lr(self):
+        step = max(1, self._step_count)
+        if step < self.warmup_steps:
+            scale = step / float(self.warmup_steps)
+        else:
+            remain = max(self.total_steps - self.warmup_steps, 1)
+            scale = max(0.0, (self.total_steps - step) / float(remain))
+
+        return [base_lr * scale for base_lr in self.base_lrs]
+
+
 class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
     def __init__(
         self,
