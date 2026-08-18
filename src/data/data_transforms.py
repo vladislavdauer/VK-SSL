@@ -1,5 +1,6 @@
 import json
 import math
+import random
 from functools import partial
 from typing import List
 from collections import namedtuple
@@ -7,12 +8,8 @@ from collections import namedtuple
 import sentencepiece as spm
 import torch
 import torchaudio
-# from src.data.librispeech_data_module import LibriSpeechDataModule
 
-
-# from lightning import Batch
 Batch = namedtuple("Batch", ["inputs", "input_lengths", "targets", "target_lengths"])
-
 
 _decibel = 2 * 20 * math.log10(torch.iinfo(torch.int16).max)
 _gain = pow(10, 0.05 * _decibel)
@@ -61,34 +58,52 @@ def _extract_labels(sp_model, samples: List):
     return targets, lengths
 
 
-def _extract_features(data_pipeline, samples: List):
-    mel_features = [_spectrogram_transform(sample[0].squeeze()).transpose(1, 0) for sample in samples]
-    features = torch.nn.utils.rnn.pad_sequence(mel_features, batch_first=True)
-    features = data_pipeline(features)
-    lengths = torch.tensor([elem.shape[0] for elem in mel_features], dtype=torch.int32)
-    return features, lengths
-
-
 class TrainTransform:
     def __init__(self, global_stats_path: str, sp_model_path: str):
         self.sp_model = spm.SentencePieceProcessor(model_file=sp_model_path)
-        self.train_data_pipeline = torch.nn.Sequential(
+
+        self.base_pipeline = torch.nn.Sequential(
             FunctionalModule(_piecewise_linear_log),
             GlobalStatsNormalization(global_stats_path),
-            FunctionalModule(partial(torch.transpose, dim0=1, dim1=2)),
-            torchaudio.transforms.FrequencyMasking(27, iid_masks=True),
-            torchaudio.transforms.FrequencyMasking(27, iid_masks=True),
-            torchaudio.transforms.TimeMasking(10000, p=0.05, iid_masks=True),
-            torchaudio.transforms.TimeMasking(10000, p=0.05, iid_masks=True),
-            torchaudio.transforms.TimeMasking(10000, p=0.05, iid_masks=True),
-            torchaudio.transforms.TimeMasking(10000, p=0.05, iid_masks=True),
-            torchaudio.transforms.TimeMasking(10000, p=0.05, iid_masks=True),
-            FunctionalModule(partial(torch.transpose, dim0=1, dim1=2)),
         )
 
+        self.freq_mask1 = torchaudio.transforms.FrequencyMasking(5, iid_masks=True)
+        self.freq_mask2 = torchaudio.transforms.FrequencyMasking(5, iid_masks=True)
+
+        self.num_time_masks = 10
+        self.time_width_ratio = 0.02
+
     def __call__(self, samples: List):
-        features, feature_lengths = _extract_features(self.train_data_pipeline, samples)
+        mel_features = [_spectrogram_transform(sample[0].squeeze()).transpose(1, 0) for sample in samples]
+        feature_lengths = torch.tensor([elem.shape[0] for elem in mel_features], dtype=torch.int32)
+
+        features = torch.nn.utils.rnn.pad_sequence(mel_features, batch_first=True)
+        features = self.base_pipeline(features)
+
+        features = features.transpose(1, 2)
+
+        features = self.freq_mask1(features)
+        features = self.freq_mask2(features)
+
+        batch_size, num_mels, max_time = features.size()
+
+        for b in range(batch_size):
+            actual_t = int(feature_lengths[b])
+
+            for _ in range(self.num_time_masks):
+                max_step = int(actual_t * self.time_width_ratio)
+                if max_step < 1:
+                    continue
+
+                mask_len = random.randint(1, max_step)
+                t0 = random.randint(0, actual_t - mask_len)
+
+                features[b, :, t0:t0 + mask_len] = 0.0
+
+        features = features.transpose(1, 2)
+
         targets, target_lengths = _extract_labels(self.sp_model, samples)
+
         return Batch(features, feature_lengths, targets, target_lengths)
 
 
@@ -101,7 +116,11 @@ class ValTransform:
         )
 
     def __call__(self, samples: List):
-        features, feature_lengths = _extract_features(self.valid_data_pipeline, samples)
+        mel_features = [_spectrogram_transform(sample[0].squeeze()).transpose(1, 0) for sample in samples]
+        features = torch.nn.utils.rnn.pad_sequence(mel_features, batch_first=True)
+        features = self.valid_data_pipeline(features)
+        feature_lengths = torch.tensor([elem.shape[0] for elem in mel_features], dtype=torch.int32)
+
         targets, target_lengths = _extract_labels(self.sp_model, samples)
         return Batch(features, feature_lengths, targets, target_lengths)
 
