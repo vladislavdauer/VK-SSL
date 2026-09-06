@@ -9,6 +9,7 @@ import torchaudio
 from torch.utils.data import DataLoader
 
 from src.data.hubert_data_module import get_hubert_finetune_data_module
+from src.data.hubert_transforms import decode_hubert_ltr
 from src.data.librispeech_data_module import TransformDataset
 from src.models.hubert_lightning_module import HubertCTCModule
 
@@ -34,7 +35,19 @@ def _test_dataloader(data_module, url):
     return DataLoader(dataset, batch_size=None)
 
 
-def eval_dataloader(model, sp_model, dataloader, subset_name, sanity_check=False):
+def _decode_targets(batch, label_type, sp_model):
+    texts = []
+    for tokens, length in zip(batch.targets, batch.target_lengths):
+        length = int(length.item())
+        target_ids = tokens[:length].detach().cpu().tolist()
+        if label_type == "spm":
+            texts.append(sp_model.decode(target_ids))
+        else:
+            texts.append(decode_hubert_ltr(target_ids))
+    return texts
+
+
+def eval_dataloader(model, label_type, sp_model, dataloader, subset_name, sanity_check=False):
     total_edit_distance = 0
     total_length = 0
 
@@ -45,11 +58,7 @@ def eval_dataloader(model, sp_model, dataloader, subset_name, sanity_check=False
 
             if sanity_check:
                 batch = item
-                actual = []
-                for tokens, length in zip(batch.targets, batch.target_lengths):
-                    length = int(length.item())
-                    target_ids = tokens[:length].detach().cpu().tolist()
-                    actual.append(sp_model.decode(target_ids))
+                actual = _decode_targets(batch, label_type, sp_model)
             else:
                 batch, sample = item
                 actual = [_transcript_from_sample(sample)]
@@ -79,11 +88,20 @@ def eval_dataloader(model, sp_model, dataloader, subset_name, sanity_check=False
 
 
 def run_eval(args):
-    sp_model = spm.SentencePieceProcessor(model_file=str(args.sp_model_path))
-    model = HubertCTCModule.load_from_checkpoint(args.checkpoint_path, sp_model=sp_model).eval()
+    label_type = str(getattr(args, "label_type", "char")).lower()
+    sp_model = None
+    if label_type == "spm":
+        sp_model = spm.SentencePieceProcessor(model_file=str(args.sp_model_path))
+
+    model = HubertCTCModule.load_from_checkpoint(
+        args.checkpoint_path,
+        sp_model=sp_model,
+        strict=False,
+    ).eval()
     data_module = get_hubert_finetune_data_module(
         str(args.librispeech_path),
-        str(args.sp_model_path),
+        sp_model_path=str(args.sp_model_path) if args.sp_model_path else None,
+        label_type=label_type,
         sanity_check=bool(args.sanity_check),
     )
 
@@ -94,6 +112,7 @@ def run_eval(args):
         model.train()
         eval_dataloader(
             model,
+            label_type,
             sp_model,
             data_module.train_dataloader(),
             "train-sanity",
@@ -105,7 +124,7 @@ def run_eval(args):
     results = {}
     for url in args.subsets:
         loader = _test_dataloader(data_module, url)
-        results[url] = eval_dataloader(model, sp_model, loader, url)
+        results[url] = eval_dataloader(model, label_type, sp_model, loader, url)
 
     for url, wer in results.items():
         logger.info(f"{url}: {wer:.4f}")
@@ -127,9 +146,15 @@ def cli_main():
     )
     parser.add_argument(
         "--sp-model-path",
+        default=None,
         type=pathlib.Path,
-        help="Path to SentencePiece model.",
-        required=True,
+        help="Path to SentencePiece model (required for --label-type spm).",
+    )
+    parser.add_argument(
+        "--label-type",
+        default="char",
+        choices=["char", "spm"],
+        help="CTC label type. (Default: char)",
     )
     parser.add_argument(
         "--use-cuda",

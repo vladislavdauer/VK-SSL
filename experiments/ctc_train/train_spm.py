@@ -55,6 +55,12 @@ def parse_args():
         help=f"File to save model to. (Default: '{default_output_path}')",
     )
     parser.add_argument(
+        "--train-subsets",
+        nargs="+",
+        default=["train-clean-100", "train-clean-360", "train-other-500"],
+        help="LibriSpeech splits for SPM. For 100h: train-clean-100.",
+    )
+    parser.add_argument(
         "--sanity_check",
         action="store_true",
     )
@@ -68,7 +74,7 @@ def run_cli():
     if args.sanity_check:
         splits = ["dev-clean"]
     else:
-        splits = ["train-clean-100", "train-clean-360", "train-other-500"]
+        splits = list(args.train_subsets)
     merged_transcripts = []
     for split in splits:
         path = pathlib.Path(root) / split

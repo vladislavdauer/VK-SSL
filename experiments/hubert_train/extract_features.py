@@ -87,7 +87,15 @@ def run_extract(args):
             index.append({"id": utt_id, "split": url, "length": int(feat.shape[0])})
 
     stacked = np.concatenate(frames, axis=0) if frames else np.zeros((0, 0), dtype=np.float32)
-    np.save(args.out_dir / "features.npy", stacked)
+    total_len = int(sum(item["length"] for item in index))
+    if total_len != int(stacked.shape[0]):
+        raise RuntimeError(
+            f"Feature dump length mismatch: index sum={total_len}, stacked={stacked.shape[0]}"
+        )
+    with tqdm(total=1, desc="save features.npy", unit="file") as bar:
+        np.save(args.out_dir / "features.npy", stacked)
+        bar.update(1)
+    tqdm.write(f"saved {stacked.shape[0]} frames x {stacked.shape[1]} -> {args.out_dir / 'features.npy'}")
     with open(args.out_dir / "index.json", "w", encoding="utf-8") as handle:
         json.dump(
             {

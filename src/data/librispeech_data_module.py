@@ -116,6 +116,13 @@ class TransformDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
 
+DEFAULT_TRAIN_SUBSETS = (
+    "train-clean-100",
+    "train-clean-360",
+    "train-other-500",
+)
+
+
 class LibriSpeechDataModule(LightningDataModule):
     librispeech_cls = torchaudio.datasets.LIBRISPEECH
 
@@ -126,7 +133,7 @@ class LibriSpeechDataModule(LightningDataModule):
         train_transform,
         val_transform,
         test_transform,
-        batch_size=16,
+        batch_size=64,
         min_duration=0.1,
         max_duration=16.7,
         max_batch_duration=None,
@@ -135,6 +142,7 @@ class LibriSpeechDataModule(LightningDataModule):
         num_workers=4,
         durations_cache_dir=None,
         sanity_check=False,
+        train_subsets=None,
     ):
         super().__init__()
         self.librispeech_path = librispeech_path
@@ -156,6 +164,7 @@ class LibriSpeechDataModule(LightningDataModule):
         self.train_shuffle = train_shuffle
         self.num_workers = num_workers
         self.sanity_check = sanity_check
+        self.train_subsets = list(train_subsets) if train_subsets else list(DEFAULT_TRAIN_SUBSETS)
 
     def _prepare_datasets(self, urls, durations_cache_attr, num_buckets):
         datasets = [
@@ -205,7 +214,7 @@ class LibriSpeechDataModule(LightningDataModule):
         if self.sanity_check:
             urls = ["dev-clean"]
         else:
-            urls = ["train-clean-360", "train-clean-100", "train-other-500"]
+            urls = self.train_subsets
 
         dataset = self._prepare_datasets(
             urls,
@@ -254,6 +263,7 @@ def get_data_module(
         sanity_check=False,
         durations_cache_dir=None,
         num_workers=4,
+        train_subsets=None,
         ):
     train_transform = TrainTransform(
         global_stats_path=global_stats_path, sp_model_path=sp_model_path
@@ -274,4 +284,5 @@ def get_data_module(
         num_workers=num_workers,
         min_duration=0.1,
         max_duration=16.7,
+        train_subsets=train_subsets,
     )

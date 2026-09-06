@@ -5,7 +5,12 @@ import torch.nn as nn
 
 from src.models.hubert.cnn_encoder import ConvFeatureExtractionModel
 from src.models.hubert.config import HubertConfig
-from src.models.hubert.masking import apply_mask, compute_span_mask
+from src.models.hubert.masking import (
+    apply_channel_mask,
+    apply_mask,
+    compute_channel_mask,
+    compute_span_mask,
+)
 from src.models.hubert.prediction_head import HubertPredictionHead
 from src.models.hubert.transformer import TransformerEncoder
 
@@ -65,6 +70,7 @@ class HubertModel(nn.Module):
         self.feat2tar_ratio = cfg.label_rate * downsample / float(cfg.sample_rate)
         self.mask_alpha = cfg.mask_alpha
         self.feature_grad_mult = cfg.feature_grad_mult
+        self.features_pen_weight = float(getattr(cfg, "features_pen_weight", 10.0))
 
     def forward_features(self, source: torch.Tensor) -> torch.Tensor:
         if self.feature_grad_mult > 0:
@@ -94,6 +100,11 @@ class HubertModel(nn.Module):
         source: torch.Tensor,
         lengths: torch.Tensor,
         tgt_layer: Optional[int] = None,
+        mask: bool = False,
+        mask_prob: Optional[float] = None,
+        fairseq_style: Optional[bool] = None,
+        mask_channel_prob: float = 0.0,
+        mask_channel_length: int = 64,
     ):
         features = self.forward_features(source)
         feat_lengths = self.feature_extractor.output_lengths(lengths)
@@ -103,7 +114,30 @@ class HubertModel(nn.Module):
         if self.post_extract_proj is not None:
             x = self.post_extract_proj(x)
 
+        x = self.dropout_input(x)
         padding_mask = self.padding_mask_from_lengths(feat_lengths, x.size(1))
+        if mask and getattr(self, "mask_emb", None) is not None:
+            span_mask = compute_span_mask(
+                feat_lengths,
+                mask_prob=float(mask_prob if mask_prob is not None else self.cfg.mask_prob),
+                mask_length=self.cfg.mask_length,
+                min_masks=self.cfg.min_masks,
+                fairseq_style=(
+                    self.cfg.fairseq_mask if fairseq_style is None else fairseq_style
+                ),
+            )
+            span_mask = span_mask & ~padding_mask
+            x = apply_mask(x, span_mask, self.mask_emb)
+            if mask_channel_prob > 0:
+                channel_mask = compute_channel_mask(
+                    batch_size=x.size(0),
+                    num_channels=x.size(2),
+                    mask_prob=float(mask_channel_prob),
+                    mask_length=int(mask_channel_length),
+                    device=x.device,
+                )
+                x = apply_channel_mask(x, channel_mask)
+
         x, hidden_states = self.encoder(x, padding_mask=padding_mask, tgt_layer=tgt_layer)
         if tgt_layer is not None:
             x = hidden_states[tgt_layer]
@@ -120,6 +154,7 @@ class HubertModel(nn.Module):
         tgt_layer: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         features = self.forward_features(source)
+        features_pen = features.float().pow(2).mean()
         feat_lengths = self.feature_extractor.output_lengths(lengths)
         feat_lengths = feat_lengths.clamp(min=0, max=features.size(2))
 
@@ -146,6 +181,7 @@ class HubertModel(nn.Module):
                 mask_prob=self.cfg.mask_prob,
                 mask_length=self.cfg.mask_length,
                 min_masks=self.cfg.min_masks,
+                fairseq_style=self.cfg.fairseq_mask,
             )
             span_mask = span_mask & ~padding_mask
             x = apply_mask(x, span_mask, self.mask_emb)
@@ -164,6 +200,7 @@ class HubertModel(nn.Module):
                 "padding_mask": padding_mask,
                 "feat_lengths": feat_lengths,
                 "hidden_states": hidden_states,
+                "features_pen": features_pen,
             }
 
         valid = ~padding_mask
@@ -189,6 +226,7 @@ class HubertModel(nn.Module):
             "padding_mask": padding_mask,
             "mask_indices": span_mask,
             "feat_lengths": feat_lengths,
+            "features_pen": features_pen,
             "x": encoded,
         }
 
@@ -210,10 +248,14 @@ class HubertModel(nn.Module):
             losses.append(loss)
 
         stacked = torch.stack(losses) if losses else torch.zeros((), device=self.mask_emb.device)
-        return stacked.mean()
+        loss = stacked.mean()
+        if self.features_pen_weight != 0.0 and "features_pen" in net_output:
+            loss = loss + self.features_pen_weight * net_output["features_pen"]
+        return loss
 
     def remove_pretraining_modules(self):
-        self.pred_head = None
+        if hasattr(self, "pred_head") and self.pred_head is not None:
+            del self.pred_head
 
     def freeze_feature_extractor(self):
         for parameter in self.feature_extractor.parameters():

@@ -57,6 +57,39 @@ class LinearWarmupDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
         return [base_lr * scale for base_lr in self.base_lrs]
 
 
+class TriStageLRScheduler(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        init_lr: float,
+        warmup_steps: int,
+        hold_steps: int,
+        decay_steps: int,
+        final_lr_scale: float = 0.05,
+        last_epoch: int = -1,
+    ):
+        self.init_lr = float(init_lr)
+        self.warmup_steps = max(1, int(warmup_steps))
+        self.hold_steps = max(0, int(hold_steps))
+        self.decay_steps = max(1, int(decay_steps))
+        self.final_lr_scale = float(final_lr_scale)
+        super().__init__(optimizer, last_epoch=last_epoch)
+
+    def get_lr(self):
+        step = max(1, self._step_count)
+        if step <= self.warmup_steps:
+            scale = step / float(self.warmup_steps)
+        elif step <= self.warmup_steps + self.hold_steps:
+            scale = 1.0
+        else:
+            decay_step = step - self.warmup_steps - self.hold_steps
+            progress = min(decay_step / float(self.decay_steps), 1.0)
+            scale = 1.0 - progress * (1.0 - self.final_lr_scale)
+
+        lr = self.init_lr * scale
+        return [lr for _ in self.base_lrs]
+
+
 class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
     def __init__(
         self,

@@ -1,4 +1,5 @@
 import pathlib
+import argparse
 from argparse import ArgumentParser
 
 import torch
@@ -10,9 +11,22 @@ from pytorch_lightning.strategies import DDPStrategy
 from src.data.hubert_data_module import get_hubert_pretrain_data_module
 from src.models.hubert_lightning_module import HubertPretrainModule
 
+PRETRAIN_REF_GPUS = 32
+
+
+def _scaled_accum(reference_gpus, gpus, override=None):
+    if override is not None:
+        return int(override)
+    return max(1, reference_gpus // max(1, int(gpus)))
+
 
 def run_train(args):
     seed_everything(1)
+    accumulate_grad_batches = _scaled_accum(
+        PRETRAIN_REF_GPUS,
+        args.gpus,
+        args.accumulate_grad_batches,
+    )
     checkpoint_dir = args.exp_dir / "checkpoints"
     checkpoint = ModelCheckpoint(
         checkpoint_dir,
@@ -26,7 +40,7 @@ def run_train(args):
         checkpoint_dir,
         monitor="Losses/train_loss",
         mode="min",
-        save_top_k=3,
+        save_top_k=5,
         save_weights_only=False,
         verbose=True,
     )
@@ -56,14 +70,15 @@ def run_train(args):
             ),
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=0,
-        gradient_clip_val=0.0,
+        precision=args.precision,
+        gradient_clip_val=float(args.gradient_clip_val),
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
-        accumulate_grad_batches=args.accumulate_grad_batches,
+        accumulate_grad_batches=accumulate_grad_batches,
         enable_progress_bar=True,
     )
     if args.max_steps is not None:
-        trainer_kwargs["max_steps"] = args.max_steps
+        trainer_kwargs["max_steps"] = int(args.max_steps)
         trainer_kwargs["max_epochs"] = -1
     else:
         trainer_kwargs["max_epochs"] = args.epochs
@@ -84,12 +99,14 @@ def run_train(args):
         else None,
         num_workers=args.num_workers,
         max_batch_duration=float(args.max_batch_duration),
+        train_subsets=args.train_subsets,
         )
     trainer.fit(model, data_module, ckpt_path=args.checkpoint_path)
 
 
 def cli_main():
-    parser = ArgumentParser()
+    parser = ArgumentParser(
+            )
     parser.add_argument(
         "--checkpoint-path",
         default=None,
@@ -145,6 +162,24 @@ def cli_main():
         help="Weight of masked-frame loss. 1.0 is masked-only. (Default: 1.0)",
     )
     parser.add_argument(
+        "--mask-prob",
+        default=0.80,
+        type=float,
+        help="Masked frame fraction. (Default: 0.80)",
+    )
+    parser.add_argument(
+        "--fairseq-mask",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Fairseq-style mask counting. (Default: True)",
+    )
+    parser.add_argument(
+        "--feature-grad-mult",
+        default=0.1,
+        type=float,
+        help="CNN gradient multiplier. (Default: 0.1)",
+    )
+    parser.add_argument(
         "--lr",
         default=5e-4,
         type=float,
@@ -160,7 +195,13 @@ def cli_main():
         "--warmup-ratio",
         default=0.08,
         type=float,
-        help="Fraction of steps for linear LR warmup. (Default: 0.08)",
+        help="LR warmup fraction. (Default: 0.08)",
+    )
+    parser.add_argument(
+        "--gradient-clip-val",
+        default=10.0,
+        type=float,
+        help="Gradient clip norm. (Default: 10.0)",
     )
     parser.add_argument(
         "--max-batch-duration",
@@ -176,9 +217,15 @@ def cli_main():
     )
     parser.add_argument(
         "--gpus",
-        default=2,
+        default=4,
         type=int,
-        help="Number of GPUs per node to use for training. (Default: 2)",
+        help="GPUs per node. (Default: 4)",
+    )
+    parser.add_argument(
+        "--accumulate-grad-batches",
+        default=None,
+        type=int,
+        help="Gradient accumulation. Default: 32 // gpus.",
     )
     parser.add_argument(
         "--epochs",
@@ -188,26 +235,32 @@ def cli_main():
     )
     parser.add_argument(
         "--max-steps",
-        default=None,
+        default=250000,
         type=int,
-        help="Train for this many optimizer steps. Overrides --epochs when set.",
-    )
-    parser.add_argument(
-        "--accumulate-grad-batches",
-        default=1,
-        type=int,
-        help="Gradient accumulation steps. (Default: 1)",
+        help="Train for this many optimizer steps. iter1: 250000, iter2: 400000. (Default: 250000)",
     )
     parser.add_argument(
         "--num-workers",
-        default=4,
+        default=6,
         type=int,
-        help="DataLoader workers per process. Use 0-2 on slow NFS. (Default: 4)",
+        help="DataLoader workers. (Default: 6)",
     )
     parser.add_argument(
         "--sanity_check",
         action="store_true",
         help="Run sanity check with small subset of data.",
+    )
+    parser.add_argument(
+        "--precision",
+        default="16-mixed",
+        choices=["32-true", "16-mixed", "bf16-mixed"],
+        help="Training precision. (Default: 16-mixed)",
+    )
+    parser.add_argument(
+        "--train-subsets",
+        nargs="+",
+        default=["train-clean-100", "train-clean-360", "train-other-500"],
+        help="LibriSpeech train splits for pretrain. Default: full ~960h (~1k).",
     )
     args = parser.parse_args()
     run_train(args)

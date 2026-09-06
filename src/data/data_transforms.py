@@ -82,23 +82,23 @@ class TrainTransform:
 
         features = features.transpose(1, 2)
 
-        features = self.freq_mask1(features)
-        features = self.freq_mask2(features)
-
-        batch_size, num_mels, max_time = features.size()
-
-        for b in range(batch_size):
-            actual_t = int(feature_lengths[b])
-
-            for _ in range(self.num_time_masks):
-                max_step = int(actual_t * self.time_width_ratio)
-                if max_step < 1:
-                    continue
-
-                mask_len = random.randint(1, max_step)
-                t0 = random.randint(0, actual_t - mask_len)
-
-                features[b, :, t0:t0 + mask_len] = 0.0
+        # features = self.freq_mask1(features)
+        # features = self.freq_mask2(features)
+        #
+        # batch_size, num_mels, max_time = features.size()
+        #
+        # for b in range(batch_size):
+        #     actual_t = int(feature_lengths[b])
+        #
+        #     for _ in range(self.num_time_masks):
+        #         max_step = int(actual_t * self.time_width_ratio)
+        #         if max_step < 1:
+        #             continue
+        #
+        #         mask_len = random.randint(1, max_step)
+        #         t0 = random.randint(0, actual_t - mask_len)
+        #
+        #         features[b, :, t0:t0 + mask_len] = 0.0
 
         features = features.transpose(1, 2)
 

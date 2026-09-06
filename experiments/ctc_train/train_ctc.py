@@ -1,4 +1,5 @@
 import pathlib
+import warnings
 from argparse import ArgumentParser
 
 import sentencepiece as spm
@@ -11,6 +12,11 @@ from pytorch_lightning.strategies import DDPStrategy
 
 from src.models.asr_lightning_module import CTCTModule
 from src.data.librispeech_data_module import get_data_module
+
+warnings.filterwarnings(
+    "ignore",
+    message="Detected call of `lr_scheduler.step()` before `optimizer.step()`",
+)
 
 
 def run_train(args):
@@ -59,10 +65,11 @@ def run_train(args):
             ),
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=0,
+        precision=args.precision,
         gradient_clip_val=0.0,
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
-        accumulate_grad_batches=32,
+        accumulate_grad_batches=8,
         enable_progress_bar=True,
     )
 
@@ -78,6 +85,7 @@ def run_train(args):
         if args.durations_cache_dir
         else None,
         num_workers=args.num_workers,
+        train_subsets=args.train_subsets,
         )
     trainer.fit(model, data_module, ckpt_path=args.checkpoint_path)
 
@@ -147,6 +155,18 @@ def cli_main():
         default=None,
         type=pathlib.Path,
         help="JSON cache for audio durations (default: <librispeech>/.duration_cache).",
+    )
+    parser.add_argument(
+        "--precision",
+        default="16-mixed",
+        choices=["32-true", "16-mixed", "bf16-mixed"],
+        help="Training precision. (Default: 16-mixed)",
+    )
+    parser.add_argument(
+        "--train-subsets",
+        nargs="+",
+        default=["train-clean-100", "train-clean-360", "train-other-500"],
+        help="LibriSpeech train splits. For 100h: train-clean-100. (Default: full 960h)",
     )
     args = parser.parse_args()
     run_train(args)

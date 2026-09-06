@@ -20,7 +20,7 @@ class HubertConfig:
     encoder_layers: int = 12
     encoder_embed_dim: int = 768
     encoder_ffn_embed_dim: int = 3072
-    encoder_attention_heads: int = 8
+    encoder_attention_heads: int = 12
     dropout: float = 0.1
     attention_dropout: float = 0.1
     activation_dropout: float = 0.0
@@ -31,13 +31,15 @@ class HubertConfig:
     conv_pos_groups: int = 16
     final_dim: int = 256
     logit_temp: float = 0.1
-    mask_prob: float = 0.08
+    mask_prob: float = 0.80
     mask_length: int = 10
     min_masks: int = 2
     num_classes: List[int] = field(default_factory=lambda: [100])
     label_rate: float = 50.0
     mask_alpha: float = 1.0
-    feature_grad_mult: float = 1.0
+    feature_grad_mult: float = 0.1
+    fairseq_mask: bool = True
+    features_pen_weight: float = 10.0
 
 
 def hubert_tiny(num_classes=None, label_rate=50.0, mask_alpha=1.0):
@@ -72,6 +74,8 @@ def hubert_tiny(num_classes=None, label_rate=50.0, mask_alpha=1.0):
         mask_prob=0.08,
         mask_length=10,
         min_masks=1,
+        features_pen_weight=0.0,
+        fairseq_mask=False,
     )
 
 
@@ -83,7 +87,7 @@ def hubert_base(num_classes=None, label_rate=50.0, mask_alpha=1.0):
         encoder_layers=12,
         encoder_embed_dim=768,
         encoder_ffn_embed_dim=3072,
-        encoder_attention_heads=8,
+        encoder_attention_heads=12,
         layerdrop=0.05,
         final_dim=256,
         num_classes=list(num_classes),
@@ -126,7 +130,15 @@ def hubert_xlarge(num_classes=None, label_rate=50.0, mask_alpha=1.0):
     )
 
 
-def get_hubert_config(name, num_classes=None, label_rate=50.0, mask_alpha=1.0):
+def get_hubert_config(
+    name,
+    num_classes=None,
+    label_rate=50.0,
+    mask_alpha=1.0,
+    mask_prob=None,
+    feature_grad_mult=None,
+    fairseq_mask=None,
+):
     factories = {
         "tiny": hubert_tiny,
         "base": hubert_base,
@@ -136,4 +148,11 @@ def get_hubert_config(name, num_classes=None, label_rate=50.0, mask_alpha=1.0):
     if name not in factories:
         raise ValueError(f"Unknown HuBERT config '{name}'. Expected one of {list(factories)}")
 
-    return factories[name](num_classes=num_classes, label_rate=label_rate, mask_alpha=mask_alpha)
+    cfg = factories[name](num_classes=num_classes, label_rate=label_rate, mask_alpha=mask_alpha)
+    if mask_prob is not None:
+        cfg.mask_prob = float(mask_prob)
+    if feature_grad_mult is not None:
+        cfg.feature_grad_mult = float(feature_grad_mult)
+    if fairseq_mask is not None:
+        cfg.fairseq_mask = bool(fairseq_mask)
+    return cfg
