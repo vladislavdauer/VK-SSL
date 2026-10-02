@@ -2,13 +2,14 @@ from typing import List, Sequence
 
 from src.data.hubert_transforms import (
     DummyHubertPretrainTransform,
+    HubertCharFinetuneTestTransform,
+    HubertCharFinetuneTransform,
     HubertFinetuneTestTransform,
     HubertFinetuneTransform,
     HubertPretrainTransform,
     load_km_file,
 )
 from src.data.librispeech_data_module import LibriSpeechDataModule
-
 
 def _load_label_maps(label_paths: Sequence[str]) -> List[dict]:
     maps = []
@@ -20,7 +21,6 @@ def _load_label_maps(label_paths: Sequence[str]) -> List[dict]:
         maps.append(loaded)
 
     return maps
-
 
 def get_hubert_pretrain_data_module(
     librispeech_path,
@@ -34,6 +34,8 @@ def get_hubert_pretrain_data_module(
     max_batch_duration=87.5,
     min_duration=0.1,
     max_duration=20.0,
+    train_subsets=None,
+    val_subsets=None,
 ):
     if dummy_labels:
         if num_classes is None:
@@ -58,22 +60,34 @@ def get_hubert_pretrain_data_module(
         num_workers=num_workers,
         durations_cache_dir=durations_cache_dir,
         sanity_check=sanity_check,
+        train_subsets=train_subsets,
+        val_subsets=val_subsets,
     )
-
 
 def get_hubert_finetune_data_module(
     librispeech_path,
-    sp_model_path,
+    sp_model_path=None,
+    label_type="char",
     sanity_check=False,
     durations_cache_dir=None,
     num_workers=4,
     max_batch_duration=200.0,
     min_duration=0.1,
     max_duration=20.0,
+    train_subsets=None,
+    val_subsets=None,
 ):
-    train_transform = HubertFinetuneTransform(sp_model_path)
-    val_transform = HubertFinetuneTransform(sp_model_path)
-    test_transform = HubertFinetuneTestTransform(sp_model_path)
+    if label_type == "spm":
+        if not sp_model_path:
+            raise ValueError("sp_model_path is required when label_type='spm'")
+
+        train_transform = HubertFinetuneTransform(sp_model_path)
+        val_transform = HubertFinetuneTransform(sp_model_path)
+        test_transform = HubertFinetuneTestTransform(sp_model_path)
+    else:
+        train_transform = HubertCharFinetuneTransform()
+        val_transform = HubertCharFinetuneTransform()
+        test_transform = HubertCharFinetuneTestTransform()
 
     return LibriSpeechDataModule(
         librispeech_path=librispeech_path,
@@ -89,4 +103,6 @@ def get_hubert_finetune_data_module(
         num_workers=num_workers,
         durations_cache_dir=durations_cache_dir,
         sanity_check=sanity_check,
+        train_subsets=train_subsets,
+        val_subsets=val_subsets,
     )

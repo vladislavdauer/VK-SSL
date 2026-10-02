@@ -11,13 +11,38 @@ HubertBatch = namedtuple(
     ["inputs", "input_lengths", "targets", "target_lengths"],
 )
 
+HUBERT_LTR_VOCAB = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ'") + ["|"]
+HUBERT_LTR_TO_ID = {char: idx for idx, char in enumerate(HUBERT_LTR_VOCAB)}
+HUBERT_BLANK_ID = len(HUBERT_LTR_VOCAB)
+
+def encode_hubert_ltr(text: str) -> List[int]:
+
+    text = " ".join(str(text).upper().split())
+    ids = []
+    for char in text.replace(" ", "|"):
+        if char in HUBERT_LTR_TO_ID:
+            ids.append(HUBERT_LTR_TO_ID[char])
+
+    if not ids:
+        return [HUBERT_LTR_TO_ID["|"]]
+    if ids[-1] != HUBERT_LTR_TO_ID["|"]:
+        ids.append(HUBERT_LTR_TO_ID["|"])
+
+    return ids
+
+def decode_hubert_ltr(token_ids: Sequence[int]) -> str:
+    chars = [
+        HUBERT_LTR_VOCAB[int(idx)]
+        for idx in token_ids
+        if 0 <= int(idx) < len(HUBERT_LTR_VOCAB)
+    ]
+    return " ".join("".join(chars).replace("|", " ").split())
 
 def librispeech_utt_id(sample) -> str:
     speaker_id = sample[3]
     chapter_id = sample[4]
     utterance_id = sample[5]
     return f"{speaker_id}-{chapter_id}-{int(utterance_id):04d}"
-
 
 def waveform_16k(sample, sample_rate: int = 16000) -> torch.Tensor:
     wav = sample[0].squeeze(0).float()
@@ -26,7 +51,6 @@ def waveform_16k(sample, sample_rate: int = 16000) -> torch.Tensor:
         wav = torchaudio.functional.resample(wav, src_sr, sample_rate)
 
     return wav
-
 
 def load_km_file(path: str) -> Dict[str, List[int]]:
     labels = {}
@@ -41,7 +65,6 @@ def load_km_file(path: str) -> Dict[str, List[int]]:
             labels[utt_id] = [int(v) for v in parts[1:]]
 
     return labels
-
 
 class HubertPretrainTransform:
     def __init__(self, label_maps: Sequence[Dict[str, List[int]]], sample_rate: int = 16000):
@@ -75,7 +98,6 @@ class HubertPretrainTransform:
             for seqs in codebook_seqs
         ]
         return HubertBatch(inputs, input_lengths, targets, target_lengths)
-
 
 class DummyHubertPretrainTransform:
     def __init__(self, num_classes: Sequence[int], label_rate: float = 100.0, sample_rate: int = 16000):
@@ -112,6 +134,29 @@ class DummyHubertPretrainTransform:
 
         return HubertBatch(inputs, input_lengths, targets, target_lengths)
 
+class HubertCharFinetuneTransform:
+    def __init__(self, sample_rate: int = 16000):
+        self.sample_rate = sample_rate
+
+    def __call__(self, samples: List):
+        waves = [waveform_16k(sample, self.sample_rate) for sample in samples]
+        lengths = torch.tensor([wav.numel() for wav in waves], dtype=torch.long)
+        inputs = torch.nn.utils.rnn.pad_sequence(waves, batch_first=True)
+        encoded = [encode_hubert_ltr(sample[2]) for sample in samples]
+        target_lengths = torch.tensor([len(seq) for seq in encoded], dtype=torch.long)
+        targets = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(seq, dtype=torch.long) for seq in encoded],
+            batch_first=True,
+            padding_value=HUBERT_BLANK_ID,
+        )
+        return HubertBatch(inputs, lengths, targets, target_lengths)
+
+class HubertCharFinetuneTestTransform:
+    def __init__(self, sample_rate: int = 16000):
+        self.inner = HubertCharFinetuneTransform(sample_rate)
+
+    def __call__(self, sample):
+        return self.inner([sample]), [sample]
 
 class HubertFinetuneTransform:
     def __init__(self, sp_model_path: str, sample_rate: int = 16000):
@@ -127,7 +172,6 @@ class HubertFinetuneTransform:
         targets, target_lengths = _extract_labels(self.sp_model, samples)
 
         return HubertBatch(inputs, lengths, targets, target_lengths)
-
 
 class HubertFinetuneTestTransform:
     def __init__(self, sp_model_path: str, sample_rate: int = 16000):

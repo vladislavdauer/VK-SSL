@@ -9,8 +9,10 @@ from pytorch_lightning import LightningDataModule
 from src.data.data_transforms import (
     TrainTransform, ValTransform, TestTransform
 )
-from src.data.duration_cache import load_durations
+from src.data.duration_cache import load_durations, open_subset
 
+LIBRISPEECH_960H = ["train-clean-360", "train-clean-100", "train-other-500"]
+LIBRISPEECH_DEV = ["dev-clean", "dev-other"]
 
 def _batch_by_length(idx_lengths, batch_size, max_batch_duration=None):
     batches = []
@@ -36,7 +38,6 @@ def _batch_by_length(idx_lengths, batch_size, max_batch_duration=None):
 
     return batches
 
-
 def filter_by_duration(dataset, durations, min_duration, max_duration):
     keep_idx = [
         i
@@ -51,7 +52,6 @@ def filter_by_duration(dataset, durations, min_duration, max_duration):
         )
     filtered_durations = [durations[i] for i in keep_idx]
     return torch.utils.data.Subset(dataset, keep_idx), filtered_durations
-
 
 class CustomBucketDataset(torch.utils.data.Dataset):
     def __init__(
@@ -103,7 +103,6 @@ class CustomBucketDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.batches)
 
-
 class TransformDataset(torch.utils.data.Dataset):
     def __init__(self, dataset, transform_fn):
         self.dataset = dataset
@@ -114,7 +113,6 @@ class TransformDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.dataset)
-
 
 class LibriSpeechDataModule(LightningDataModule):
     librispeech_cls = torchaudio.datasets.LIBRISPEECH
@@ -135,9 +133,13 @@ class LibriSpeechDataModule(LightningDataModule):
         num_workers=4,
         durations_cache_dir=None,
         sanity_check=False,
+        train_subsets=None,
+        val_subsets=None,
     ):
         super().__init__()
         self.librispeech_path = librispeech_path
+        self.train_subsets = list(train_subsets) if train_subsets else list(LIBRISPEECH_960H)
+        self.val_subsets = list(val_subsets) if val_subsets else list(LIBRISPEECH_DEV)
         self.durations_cache_dir = Path(
             durations_cache_dir
             if durations_cache_dir is not None
@@ -158,9 +160,7 @@ class LibriSpeechDataModule(LightningDataModule):
         self.sanity_check = sanity_check
 
     def _prepare_datasets(self, urls, durations_cache_attr, num_buckets):
-        datasets = [
-            self.librispeech_cls(self.librispeech_path, url=url) for url in urls
-        ]
+        datasets = [open_subset(self.librispeech_path, url) for url in urls]
 
         cached = getattr(self, durations_cache_attr)
         if not cached:
@@ -169,7 +169,7 @@ class LibriSpeechDataModule(LightningDataModule):
                 durations = load_durations(
                     self.durations_cache_dir,
                     url,
-                    expected_n=len(dataset._walker),
+                    expected_n=len(dataset),
                 )
                 if int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0))) == 0:
                     print(
@@ -202,10 +202,7 @@ class LibriSpeechDataModule(LightningDataModule):
         return torch.utils.data.ConcatDataset(bucketed)
 
     def train_dataloader(self):
-        if self.sanity_check:
-            urls = ["dev-clean"]
-        else:
-            urls = ["train-clean-360", "train-clean-100", "train-other-500"]
+        urls = ["dev-clean"] if self.sanity_check else self.train_subsets
 
         dataset = self._prepare_datasets(
             urls,
@@ -221,10 +218,7 @@ class LibriSpeechDataModule(LightningDataModule):
         )
 
     def val_dataloader(self):
-        if self.sanity_check:
-            urls = ["dev-clean"]
-        else:
-            urls = ["dev-clean", "dev-other"]
+        urls = ["dev-clean"] if self.sanity_check else self.val_subsets
 
         dataset = self._prepare_datasets(
             urls,
@@ -245,7 +239,6 @@ class LibriSpeechDataModule(LightningDataModule):
             dataset = self.librispeech_cls(self.librispeech_path, url="test-clean")
         dataset = TransformDataset(dataset, self.test_transform)
         return torch.utils.data.DataLoader(dataset, batch_size=None)
-
 
 def get_data_module(
         librispeech_path,
