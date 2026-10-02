@@ -1,6 +1,5 @@
 import torch
 
-
 def compute_span_mask(
     lengths: torch.Tensor,
     mask_prob: float,
@@ -40,6 +39,30 @@ def compute_span_mask(
 
     return mask
 
+def compute_channel_mask(
+    batch_size: int,
+    num_channels: int,
+    mask_prob: float,
+    mask_length: int,
+    device: torch.device,
+):
+    mask = torch.zeros(batch_size, num_channels, dtype=torch.bool, device=device)
+    if mask_prob <= 0 or mask_length < 1 or num_channels < 1:
+        return mask
+
+    span = min(mask_length, num_channels)
+    max_start = max(num_channels - span + 1, 1)
+    for i in range(batch_size):
+        num_starts = int(mask_prob * num_channels / float(mask_length) + torch.rand(()).item())
+        num_starts = min(max(num_starts, 0), max_start)
+        if num_starts == 0:
+            continue
+
+        starts = torch.randperm(max_start)[:num_starts]
+        for start in starts.tolist():
+            mask[i, start : min(start + span, num_channels)] = True
+
+    return mask
 
 def apply_mask(features: torch.Tensor, mask: torch.Tensor, mask_emb: torch.Tensor):
     x = features.clone()

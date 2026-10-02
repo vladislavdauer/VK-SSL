@@ -4,12 +4,12 @@ import torch
 from pytorch_lightning import LightningModule
 from torchmetrics.text import WordErrorRate
 
+from src.data.hubert_transforms import HUBERT_LTR_VOCAB, decode_hubert_ltr
 from src.models.hubert.config import get_hubert_config
 from src.models.hubert.hubert_model import HubertModel
-from src.opt.schedulers import LinearWarmupDecayScheduler, NoamAnnealing
+from src.opt.schedulers import LinearWarmupDecayScheduler, TriStageLRScheduler
 
 _expected_spm_vocab_size = 128
-
 
 class HubertPretrainModule(LightningModule):
     def __init__(self, args=None):
@@ -23,9 +23,11 @@ class HubertPretrainModule(LightningModule):
                 num_classes=num_classes,
                 label_rate=float(args.label_rate),
                 mask_alpha=float(args.mask_alpha),
+                mask_prob=getattr(args, "mask_prob", None),
             )
         )
-        self.optimizer = torch.optim.Adam(
+
+        self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=float(args.lr),
             betas=(0.9, 0.98),
@@ -45,6 +47,12 @@ class HubertPretrainModule(LightningModule):
         )
         loss = self.model.masked_prediction_loss(net_output)
         self.log(f"Losses/{step_type}_loss", loss, on_epoch=True, sync_dist=True, prog_bar=True)
+        self.log(
+            f"Losses/{step_type}_features_pen",
+            net_output["features_pen"],
+            on_epoch=True,
+            sync_dist=True,
+        )
 
         masked = net_output["mask_indices"]
         valid = ~net_output["padding_mask"]
@@ -91,18 +99,22 @@ class HubertPretrainModule(LightningModule):
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
         }
 
-
 class HubertCTCModule(LightningModule):
     def __init__(self, args=None, sp_model=None):
         super().__init__()
         self.save_hyperparameters(args)
         self.args = args
         self.sp_model = sp_model
-        spm_vocab_size = self.sp_model.get_piece_size()
-        assert spm_vocab_size == _expected_spm_vocab_size, (
-            f"SPM vocab size ({spm_vocab_size}) must be equal to expected vocab size ({_expected_spm_vocab_size})"
-        )
-        self.blank_idx = spm_vocab_size
+        self.label_type = getattr(args, "label_type", "char")
+        if self.label_type == "spm":
+            vocab_size = self.sp_model.get_piece_size()
+            assert vocab_size == _expected_spm_vocab_size, (
+                f"SPM vocab size ({vocab_size}) must be equal to expected vocab size ({_expected_spm_vocab_size})"
+            )
+        else:
+            vocab_size = len(HUBERT_LTR_VOCAB)
+
+        self.blank_idx = vocab_size
 
         num_classes = [int(v) for v in str(args.num_classes).split(",") if str(v).strip()]
         self.encoder = HubertModel(
@@ -118,9 +130,15 @@ class HubertCTCModule(LightningModule):
 
         self.encoder.remove_pretraining_modules()
         self.encoder.freeze_feature_extractor()
-        self.encoder.encoder.layerdrop = 0.0
+        self.encoder.set_finetune_dropout(
+            dropout=float(getattr(args, "dropout", 0.0)),
+            attention_dropout=float(getattr(args, "attention_dropout", 0.0)),
+            activation_dropout=float(getattr(args, "activation_dropout", 0.1)),
+            layerdrop=float(getattr(args, "layerdrop", 0.1)),
+        )
 
-        self.ctc_out = torch.nn.Linear(self.encoder.cfg.encoder_embed_dim, spm_vocab_size + 1)
+        self.final_dropout = torch.nn.Dropout(float(getattr(args, "final_dropout", 0.0)))
+        self.ctc_out = torch.nn.Linear(self.encoder.cfg.encoder_embed_dim, vocab_size + 1)
         torch.nn.init.normal_(self.ctc_out.weight, mean=0.0, std=0.01)
         torch.nn.init.constant_(self.ctc_out.bias, 0.0)
 
@@ -134,12 +152,11 @@ class HubertCTCModule(LightningModule):
                 self.ctc_out.parameters(),
             ]
         )
-        self.optimizer = torch.optim.AdamW(
+        self.optimizer = torch.optim.Adam(
             trainable,
             lr=float(args.lr),
-            eps=1e-9,
             betas=(0.9, 0.98),
-            weight_decay=1e-3,
+            eps=1e-8,
         )
         freeze_steps = int(getattr(args, "freeze_steps", 0))
         if freeze_steps > 0:
@@ -181,6 +198,24 @@ class HubertCTCModule(LightningModule):
         if should_freeze != self._frozen_transformer:
             self._set_transformer_frozen(should_freeze)
 
+    def _decode_ids(self, token_ids):
+        if self.label_type == "spm":
+            return self.sp_model.decode(list(token_ids))
+
+        return decode_hubert_ltr(token_ids)
+
+    def _collapse(self, seq):
+        collapsed = []
+        prev = self.blank_idx
+        for idx in seq.tolist():
+            idx = int(idx)
+            if idx != prev and idx != self.blank_idx:
+                collapsed.append(idx)
+
+            prev = idx
+
+        return collapsed
+
     def _greedy_texts(self, log_probs, src_lengths, batch):
         pred_ids = log_probs.argmax(dim=-1)
 
@@ -189,29 +224,11 @@ class HubertCTCModule(LightningModule):
 
         for i in range(pred_ids.size(0)):
             src_len = int(src_lengths[i].item())
-            seq = pred_ids[i, :src_len]
-
-            collapsed = []
-            prev = self.blank_idx
-
-            for idx in seq:
-                idx = int(idx.item())
-
-                if idx != prev and idx != self.blank_idx:
-                    collapsed.append(idx)
-
-                prev = idx
-
-            pred_texts.append(self.sp_model.decode(collapsed))
+            pred_texts.append(self._decode_ids(self._collapse(pred_ids[i, :src_len])))
 
             target_len = int(batch.target_lengths[i].item())
-            target_ids = (
-                batch.targets[i, :target_len]
-                .detach()
-                .cpu()
-                .tolist()
-            )
-            target_texts.append(self.sp_model.decode(target_ids))
+            target_ids = batch.targets[i, :target_len].detach().cpu().tolist()
+            target_texts.append(self._decode_ids(target_ids))
 
         return pred_texts, target_texts
 
@@ -219,9 +236,19 @@ class HubertCTCModule(LightningModule):
         if batch is None:
             return None
 
-        encoded, src_lengths, _ = self.encoder.extract_features(batch.inputs, batch.input_lengths)
+        apply_mask = bool(getattr(self.args, "apply_ft_mask", True)) and step_type == "train"
+        encoded, src_lengths, _ = self.encoder.extract_features(
+            batch.inputs,
+            batch.input_lengths,
+            mask=apply_mask,
+            mask_prob=float(getattr(self.args, "ft_mask_prob", 0.065)),
+            mask_channel_prob=(
+                float(getattr(self.args, "ft_mask_channel_prob", 0.5)) if apply_mask else 0.0
+            ),
+            mask_channel_length=int(getattr(self.args, "ft_mask_channel_length", 64)),
+        )
 
-        logits = self.ctc_out(encoded)
+        logits = self.ctc_out(self.final_dropout(encoded))
         probs = self.log_softmax(logits).transpose(0, 1)
 
         loss = self.loss(
@@ -259,39 +286,30 @@ class HubertCTCModule(LightningModule):
         features = batch.inputs.to(self.device)
         lengths = batch.input_lengths.to(self.device)
         encoded, src_lengths, _ = self.encoder.extract_features(features, lengths)
-        logits = self.ctc_out(encoded)
+        logits = self.ctc_out(self.final_dropout(encoded))
         log_probs = self.log_softmax(logits)
 
         predicted_ids = torch.argmax(log_probs, dim=-1)
 
-        results = []
-        for seq, length in zip(predicted_ids, src_lengths):
-            seq = seq[: int(length.item())]
-
-            collapsed = []
-            prev = self.blank_idx
-
-            for idx in seq:
-                idx = int(idx.item())
-                if idx != prev and idx != self.blank_idx:
-                    collapsed.append(idx)
-                prev = idx
-
-            results.append(self.sp_model.decode(collapsed))
+        results = [
+            self._decode_ids(self._collapse(seq[: int(length.item())]))
+            for seq, length in zip(predicted_ids, src_lengths)
+        ]
 
         return results[0] if len(results) == 1 else results
 
     def configure_optimizers(self):
-        self.warmup_lr_scheduler = NoamAnnealing(
+        scheduler = TriStageLRScheduler(
             self.optimizer,
-            d_model=self.encoder.cfg.encoder_embed_dim,
-            warmup_steps=int(getattr(self.args, "warmup_steps", 10000)),
-            min_lr=1e-6,
+            warmup_steps=int(getattr(self.args, "warmup_steps", 8000)),
+            hold_steps=int(getattr(self.args, "hold_steps", 32000)),
+            decay_steps=int(getattr(self.args, "decay_steps", 40000)),
+            final_lr_scale=float(getattr(self.args, "final_lr_scale", 0.05)),
         )
 
         return {
             "optimizer": self.optimizer,
-            "lr_scheduler": {"scheduler": self.warmup_lr_scheduler, "interval": "step"},
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
         }
 
     def training_step(self, batch, batch_idx):

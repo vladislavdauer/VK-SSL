@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-
 @dataclass
 class HubertConfig:
     sample_rate: int = 16000
@@ -20,7 +19,7 @@ class HubertConfig:
     encoder_layers: int = 12
     encoder_embed_dim: int = 768
     encoder_ffn_embed_dim: int = 3072
-    encoder_attention_heads: int = 8
+    encoder_attention_heads: int = 12
     dropout: float = 0.1
     attention_dropout: float = 0.1
     activation_dropout: float = 0.0
@@ -31,6 +30,7 @@ class HubertConfig:
     conv_pos_groups: int = 16
     final_dim: int = 256
     logit_temp: float = 0.1
+
     mask_prob: float = 0.08
     mask_length: int = 10
     min_masks: int = 2
@@ -39,6 +39,7 @@ class HubertConfig:
     mask_alpha: float = 1.0
     feature_grad_mult: float = 1.0
 
+    feature_penalty_weight: float = 10.0
 
 def hubert_tiny(num_classes=None, label_rate=50.0, mask_alpha=1.0):
     if num_classes is None:
@@ -74,7 +75,6 @@ def hubert_tiny(num_classes=None, label_rate=50.0, mask_alpha=1.0):
         min_masks=1,
     )
 
-
 def hubert_base(num_classes=None, label_rate=50.0, mask_alpha=1.0):
     if num_classes is None:
         num_classes = [100]
@@ -83,14 +83,14 @@ def hubert_base(num_classes=None, label_rate=50.0, mask_alpha=1.0):
         encoder_layers=12,
         encoder_embed_dim=768,
         encoder_ffn_embed_dim=3072,
-        encoder_attention_heads=8,
+        encoder_attention_heads=12,
         layerdrop=0.05,
         final_dim=256,
+        feature_grad_mult=0.1,
         num_classes=list(num_classes),
         label_rate=label_rate,
         mask_alpha=mask_alpha,
     )
-
 
 def hubert_large(num_classes=None, label_rate=50.0, mask_alpha=1.0):
     if num_classes is None:
@@ -108,7 +108,6 @@ def hubert_large(num_classes=None, label_rate=50.0, mask_alpha=1.0):
         mask_alpha=mask_alpha,
     )
 
-
 def hubert_xlarge(num_classes=None, label_rate=50.0, mask_alpha=1.0):
     if num_classes is None:
         num_classes = [500]
@@ -125,8 +124,7 @@ def hubert_xlarge(num_classes=None, label_rate=50.0, mask_alpha=1.0):
         mask_alpha=mask_alpha,
     )
 
-
-def get_hubert_config(name, num_classes=None, label_rate=50.0, mask_alpha=1.0):
+def get_hubert_config(name, num_classes=None, label_rate=50.0, mask_alpha=1.0, mask_prob=None):
     factories = {
         "tiny": hubert_tiny,
         "base": hubert_base,
@@ -136,4 +134,8 @@ def get_hubert_config(name, num_classes=None, label_rate=50.0, mask_alpha=1.0):
     if name not in factories:
         raise ValueError(f"Unknown HuBERT config '{name}'. Expected one of {list(factories)}")
 
-    return factories[name](num_classes=num_classes, label_rate=label_rate, mask_alpha=mask_alpha)
+    cfg = factories[name](num_classes=num_classes, label_rate=label_rate, mask_alpha=mask_alpha)
+    if mask_prob is not None:
+        cfg.mask_prob = float(mask_prob)
+
+    return cfg

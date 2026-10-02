@@ -5,10 +5,9 @@ import torch.nn as nn
 
 from src.models.hubert.cnn_encoder import ConvFeatureExtractionModel
 from src.models.hubert.config import HubertConfig
-from src.models.hubert.masking import apply_mask, compute_span_mask
+from src.models.hubert.masking import apply_mask, compute_channel_mask, compute_span_mask
 from src.models.hubert.prediction_head import HubertPredictionHead
 from src.models.hubert.transformer import TransformerEncoder
-
 
 class GradMultiply(torch.autograd.Function):
     @staticmethod
@@ -19,7 +18,6 @@ class GradMultiply(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         return grad * ctx.scale, None
-
 
 class HubertModel(nn.Module):
     def __init__(self, cfg: HubertConfig):
@@ -65,6 +63,7 @@ class HubertModel(nn.Module):
         self.feat2tar_ratio = cfg.label_rate * downsample / float(cfg.sample_rate)
         self.mask_alpha = cfg.mask_alpha
         self.feature_grad_mult = cfg.feature_grad_mult
+        self.feature_penalty_weight = cfg.feature_penalty_weight
 
     def forward_features(self, source: torch.Tensor) -> torch.Tensor:
         if self.feature_grad_mult > 0:
@@ -94,6 +93,10 @@ class HubertModel(nn.Module):
         source: torch.Tensor,
         lengths: torch.Tensor,
         tgt_layer: Optional[int] = None,
+        mask: bool = False,
+        mask_prob: Optional[float] = None,
+        mask_channel_prob: float = 0.0,
+        mask_channel_length: int = 64,
     ):
         features = self.forward_features(source)
         feat_lengths = self.feature_extractor.output_lengths(lengths)
@@ -103,7 +106,28 @@ class HubertModel(nn.Module):
         if self.post_extract_proj is not None:
             x = self.post_extract_proj(x)
 
+        x = self.dropout_input(x)
         padding_mask = self.padding_mask_from_lengths(feat_lengths, x.size(1))
+
+        if mask:
+            span_mask = compute_span_mask(
+                feat_lengths,
+                mask_prob=self.cfg.mask_prob if mask_prob is None else float(mask_prob),
+                mask_length=self.cfg.mask_length,
+                min_masks=self.cfg.min_masks,
+            )
+            x = apply_mask(x, span_mask & ~padding_mask, self.mask_emb)
+
+        if mask and mask_channel_prob > 0:
+            channel_mask = compute_channel_mask(
+                x.size(0),
+                x.size(2),
+                mask_prob=mask_channel_prob,
+                mask_length=mask_channel_length,
+                device=x.device,
+            )
+            x = x.masked_fill(channel_mask.unsqueeze(1), 0.0)
+
         x, hidden_states = self.encoder(x, padding_mask=padding_mask, tgt_layer=tgt_layer)
         if tgt_layer is not None:
             x = hidden_states[tgt_layer]
@@ -129,6 +153,8 @@ class HubertModel(nn.Module):
                 feat_lengths,
                 torch.full_like(feat_lengths, features.size(2)),
             )
+
+        features_pen = features.float().pow(2).mean()
 
         x = features.transpose(1, 2)
         x = self.layer_norm(x)
@@ -189,6 +215,7 @@ class HubertModel(nn.Module):
             "padding_mask": padding_mask,
             "mask_indices": span_mask,
             "feat_lengths": feat_lengths,
+            "features_pen": features_pen,
             "x": encoded,
         }
 
@@ -210,7 +237,13 @@ class HubertModel(nn.Module):
             losses.append(loss)
 
         stacked = torch.stack(losses) if losses else torch.zeros((), device=self.mask_emb.device)
-        return stacked.mean()
+        loss = stacked.mean()
+
+        features_pen = net_output.get("features_pen")
+        if self.feature_penalty_weight > 0 and features_pen is not None:
+            loss = loss + self.feature_penalty_weight * features_pen
+
+        return loss
 
     def remove_pretraining_modules(self):
         self.pred_head = None
@@ -220,3 +253,12 @@ class HubertModel(nn.Module):
             parameter.requires_grad = False
 
         self.feature_grad_mult = 0.0
+
+    def set_finetune_dropout(self, dropout, attention_dropout, activation_dropout, layerdrop):
+
+        self.encoder.dropout = dropout
+        self.encoder.layerdrop = layerdrop
+        for layer in self.encoder.layers:
+            layer.dropout = dropout
+            layer.activation_dropout = activation_dropout
+            layer.self_attn.dropout = attention_dropout
