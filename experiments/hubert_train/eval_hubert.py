@@ -2,8 +2,6 @@ import logging
 import pathlib
 from argparse import ArgumentParser
 
-import sentencepiece as spm
-
 import torch
 import torchaudio
 from torch.utils.data import DataLoader
@@ -15,10 +13,8 @@ from src.models.hubert_lightning_module import HubertCTCModule
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger()
 
-
 def compute_word_level_distance(seq1, seq2):
     return torchaudio.functional.edit_distance(seq1.lower().split(), seq2.lower().split())
-
 
 def _transcript_from_sample(sample):
     if isinstance(sample, list) and len(sample) == 1:
@@ -27,14 +23,12 @@ def _transcript_from_sample(sample):
         return str(sample[2])
     raise TypeError(f"Unexpected sample format: {type(sample)}")
 
-
 def _test_dataloader(data_module, url):
     dataset = data_module.librispeech_cls(data_module.librispeech_path, url=url)
     dataset = TransformDataset(dataset, data_module.test_transform)
     return DataLoader(dataset, batch_size=None)
 
-
-def eval_dataloader(model, sp_model, dataloader, subset_name, sanity_check=False):
+def eval_dataloader(model, dataloader, subset_name, sanity_check=False):
     total_edit_distance = 0
     total_length = 0
 
@@ -49,7 +43,7 @@ def eval_dataloader(model, sp_model, dataloader, subset_name, sanity_check=False
                 for tokens, length in zip(batch.targets, batch.target_lengths):
                     length = int(length.item())
                     target_ids = tokens[:length].detach().cpu().tolist()
-                    actual.append(sp_model.decode(target_ids))
+                    actual.append(model._decode_ids(target_ids))
             else:
                 batch, sample = item
                 actual = [_transcript_from_sample(sample)]
@@ -77,13 +71,21 @@ def eval_dataloader(model, sp_model, dataloader, subset_name, sanity_check=False
     logger.info(f"[{subset_name}] Final corpus WER: {final_wer:.4f}")
     return final_wer
 
-
 def run_eval(args):
-    sp_model = spm.SentencePieceProcessor(model_file=str(args.sp_model_path))
+    sp_model = None
+    if args.label_type == "spm":
+        import sentencepiece as spm
+
+        if not args.sp_model_path:
+            raise ValueError("--sp-model-path is required for --label-type spm")
+
+        sp_model = spm.SentencePieceProcessor(model_file=str(args.sp_model_path))
+
     model = HubertCTCModule.load_from_checkpoint(args.checkpoint_path, sp_model=sp_model).eval()
     data_module = get_hubert_finetune_data_module(
         str(args.librispeech_path),
-        str(args.sp_model_path),
+        sp_model_path=str(args.sp_model_path) if args.sp_model_path else None,
+        label_type=args.label_type,
         sanity_check=bool(args.sanity_check),
     )
 
@@ -94,7 +96,6 @@ def run_eval(args):
         model.train()
         eval_dataloader(
             model,
-            sp_model,
             data_module.train_dataloader(),
             "train-sanity",
             sanity_check=True,
@@ -105,11 +106,10 @@ def run_eval(args):
     results = {}
     for url in args.subsets:
         loader = _test_dataloader(data_module, url)
-        results[url] = eval_dataloader(model, sp_model, loader, url)
+        results[url] = eval_dataloader(model, loader, url)
 
     for url, wer in results.items():
         logger.info(f"{url}: {wer:.4f}")
-
 
 def cli_main():
     parser = ArgumentParser()
@@ -126,10 +126,16 @@ def cli_main():
         required=True,
     )
     parser.add_argument(
+        "--label-type",
+        default="char",
+        choices=["char", "spm"],
+        help="Must match the fine-tuned checkpoint. (Default: char)",
+    )
+    parser.add_argument(
         "--sp-model-path",
+        default=None,
         type=pathlib.Path,
-        help="Path to SentencePiece model.",
-        required=True,
+        help="Path to SentencePiece model, required only for --label-type spm.",
     )
     parser.add_argument(
         "--use-cuda",
@@ -152,7 +158,6 @@ def cli_main():
     )
     args = parser.parse_args()
     run_eval(args)
-
 
 if __name__ == "__main__":
     cli_main()

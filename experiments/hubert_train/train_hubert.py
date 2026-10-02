@@ -10,7 +10,6 @@ from pytorch_lightning.strategies import DDPStrategy
 from src.data.hubert_data_module import get_hubert_pretrain_data_module
 from src.models.hubert_lightning_module import HubertPretrainModule
 
-
 def run_train(args):
     seed_everything(1)
     checkpoint_dir = args.exp_dir / "checkpoints"
@@ -56,19 +55,23 @@ def run_train(args):
             ),
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=0,
-        gradient_clip_val=0.0,
+        precision="32-true",
+        gradient_clip_val=10.0,
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
         accumulate_grad_batches=args.accumulate_grad_batches,
         enable_progress_bar=True,
     )
     if args.max_steps is not None:
-        trainer_kwargs["max_steps"] = args.max_steps
+        trainer_kwargs["max_steps"] = int(args.max_steps)
         trainer_kwargs["max_epochs"] = -1
     else:
         trainer_kwargs["max_epochs"] = args.epochs
 
     trainer = Trainer(**trainer_kwargs)
+    if trainer.is_global_zero:
+        for logger in trainer.loggers:
+            print(f"[rank0] {type(logger).__name__} -> {logger.log_dir}", flush=True)
 
     model = HubertPretrainModule(args)
     dummy = bool(args.sanity_check and not args.label_paths)
@@ -84,9 +87,9 @@ def run_train(args):
         else None,
         num_workers=args.num_workers,
         max_batch_duration=float(args.max_batch_duration),
+        train_subsets=args.train_subsets,
         )
     trainer.fit(model, data_module, ckpt_path=args.checkpoint_path)
-
 
 def cli_main():
     parser = ArgumentParser()
@@ -114,6 +117,15 @@ def cli_main():
         default=None,
         type=pathlib.Path,
         help="One or more .km label files. Optional with --sanity_check.",
+    )
+    parser.add_argument(
+        "--train-subsets",
+        nargs="+",
+        default=["train-clean-100", "train-clean-360", "train-other-500"],
+        help=(
+            "LibriSpeech splits to pre-train on. Use 'train-clean-100' for 100 h. "
+            "(Default: all 960 h)"
+        ),
     )
     parser.add_argument(
         "--durations-cache-dir",
@@ -145,6 +157,15 @@ def cli_main():
         help="Weight of masked-frame loss. 1.0 is masked-only. (Default: 1.0)",
     )
     parser.add_argument(
+        "--mask-prob",
+        default=0.08,
+        type=float,
+        help=(
+            "Fraction of frames used as mask span starts, = fairseq mask_prob 0.80 "
+            "divided by span 10. (Default: 0.08)"
+        ),
+    )
+    parser.add_argument(
         "--lr",
         default=5e-4,
         type=float,
@@ -164,9 +185,13 @@ def cli_main():
     )
     parser.add_argument(
         "--max-batch-duration",
-        default=87.5,
+        default=43.75,
         type=float,
-        help="Max seconds of audio per GPU batch. (Default: 87.5)",
+        help=(
+            "Max seconds of audio per GPU batch. "
+            "Default 43.75 fits fp32; with --accumulate-grad-batches 16 and 4 GPUs "
+            "matches paper effective batch 32×87.5s."
+        ),
     )
     parser.add_argument(
         "--nodes",
@@ -176,9 +201,9 @@ def cli_main():
     )
     parser.add_argument(
         "--gpus",
-        default=2,
+        default=4,
         type=int,
-        help="Number of GPUs per node to use for training. (Default: 2)",
+        help="Number of GPUs per node to use for training. (Default: 4)",
     )
     parser.add_argument(
         "--epochs",
@@ -188,15 +213,18 @@ def cli_main():
     )
     parser.add_argument(
         "--max-steps",
-        default=None,
+        default=250000,
         type=int,
-        help="Train for this many optimizer steps. Overrides --epochs when set.",
+        help="Optimizer steps (paper it1: 250000, it2: 400000). (Default: 250000)",
     )
     parser.add_argument(
         "--accumulate-grad-batches",
-        default=1,
+        default=16,
         type=int,
-        help="Gradient accumulation steps. (Default: 1)",
+        help=(
+            "Gradient accumulation. Default 16 with 4 GPUs and batch 43.75s "
+            "→ same effective audio as paper 32×87.5s."
+        ),
     )
     parser.add_argument(
         "--num-workers",
@@ -211,7 +239,6 @@ def cli_main():
     )
     args = parser.parse_args()
     run_train(args)
-
 
 if __name__ == "__main__":
     cli_main()

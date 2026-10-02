@@ -1,23 +1,65 @@
 import json
 import pathlib
+import struct
 from argparse import ArgumentParser
 
 import numpy as np
 import torch
-import torchaudio
 from tqdm import tqdm
 
+from src.data.duration_cache import open_subset
 from src.data.hubert_transforms import librispeech_utt_id, waveform_16k
 from src.models.hubert.config import get_hubert_config
 from src.models.hubert.hubert_model import HubertModel
 from src.models.hubert.kmeans import extract_mfcc_39
 
+class NpyStreamWriter:
+\
+\
+\
+\
+\
+
+    HEADER_BYTES = 4096
+    MAGIC = b"\x93NUMPY\x01\x00"
+
+    def __init__(self, path):
+        self.path = pathlib.Path(path)
+        self.handle = open(self.path, "wb")
+        self.handle.write(b"\0" * self.HEADER_BYTES)
+        self.rows = 0
+        self.dim = None
+
+    def append(self, rows: np.ndarray):
+        rows = np.ascontiguousarray(rows, dtype="<f4")
+        if rows.ndim != 2:
+            raise ValueError(f"Expected 2-D features, got shape {rows.shape}")
+        if self.dim is None:
+            self.dim = int(rows.shape[1])
+        elif rows.shape[1] != self.dim:
+            raise ValueError(f"Feature dim changed from {self.dim} to {rows.shape[1]}")
+
+        self.handle.write(rows.tobytes())
+        self.rows += int(rows.shape[0])
+
+    def close(self):
+        header = repr(
+            {"descr": "<f4", "fortran_order": False, "shape": (self.rows, self.dim or 0)}
+        )
+        body_len = self.HEADER_BYTES - len(self.MAGIC) - 2
+        header = header.ljust(body_len - 1) + "\n"
+        self.handle.seek(0)
+        self.handle.write(self.MAGIC + struct.pack("<H", body_len) + header.encode("latin1"))
+        self.handle.close()
+
+    def abort(self):
+        self.handle.close()
+        self.path.unlink(missing_ok=True)
 
 def _parse_urls(args):
     if args.sanity_check:
         return ["dev-clean"]
     return list(args.subsets)
-
 
 def _load_encoder(args):
     num_classes = [int(v) for v in str(args.num_classes).split(",") if str(v).strip()]
@@ -44,7 +86,6 @@ def _load_encoder(args):
 
     return model
 
-
 def extract_one(args, model, sample):
     wav = waveform_16k(sample, 16000)
     if args.feature_type == "mfcc":
@@ -64,7 +105,6 @@ def extract_one(args, model, sample):
     t = int(feat_lengths[0].item())
     return hidden[0, :t].detach().cpu().numpy()
 
-
 def run_extract(args):
     args.out_dir.mkdir(parents=True, exist_ok=True)
     model = None
@@ -74,20 +114,24 @@ def run_extract(args):
 
         model = _load_encoder(args)
 
-    frames = []
     index = []
-    for url in _parse_urls(args):
-        dataset = torchaudio.datasets.LIBRISPEECH(str(args.librispeech_path), url=url)
-        n = len(dataset) if not args.sanity_check else min(len(dataset), 32)
-        for i in tqdm(range(n), desc=f"extract/{url}"):
-            sample = dataset[i]
-            utt_id = librispeech_utt_id(sample)
-            feat = extract_one(args, model, sample)
-            frames.append(feat.astype(np.float32))
-            index.append({"id": utt_id, "split": url, "length": int(feat.shape[0])})
+    writer = NpyStreamWriter(args.out_dir / "features.npy")
+    try:
+        for url in _parse_urls(args):
+            dataset = open_subset(args.librispeech_path, url)
+            n = len(dataset) if not args.sanity_check else min(len(dataset), 32)
+            for i in tqdm(range(n), desc=f"extract/{url}"):
+                sample = dataset[i]
+                utt_id = librispeech_utt_id(sample)
+                feat = extract_one(args, model, sample)
+                writer.append(feat)
+                index.append({"id": utt_id, "split": url, "length": int(feat.shape[0])})
+    except BaseException:
+        writer.abort()
+        raise
 
-    stacked = np.concatenate(frames, axis=0) if frames else np.zeros((0, 0), dtype=np.float32)
-    np.save(args.out_dir / "features.npy", stacked)
+    writer.close()
+
     with open(args.out_dir / "index.json", "w", encoding="utf-8") as handle:
         json.dump(
             {
@@ -98,7 +142,6 @@ def run_extract(args):
             },
             handle,
         )
-
 
 def cli_main():
     parser = ArgumentParser()
@@ -153,7 +196,10 @@ def cli_main():
         "--subsets",
         nargs="+",
         default=["train-clean-100", "train-clean-360", "train-other-500"],
-        help="LibriSpeech splits to extract. (Default: train-clean-100 train-clean-360 train-other-500)",
+        help=(
+            "Splits to extract. Include dev-clean dev-other so pre-train validation has "
+            "labels. (Default: train-clean-100 train-clean-360 train-other-500)"
+        ),
     )
     parser.add_argument(
         "--use-cuda",
@@ -167,7 +213,6 @@ def cli_main():
     )
     args = parser.parse_args()
     run_extract(args)
-
 
 if __name__ == "__main__":
     cli_main()
