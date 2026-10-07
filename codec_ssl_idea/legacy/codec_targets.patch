@@ -1,0 +1,680 @@
+diff --git a/experiments/hubert_train/dump_codec_labels.py b/experiments/hubert_train/dump_codec_labels.py
+new file mode 100644
+index 0000000..c966343
+--- /dev/null
++++ b/experiments/hubert_train/dump_codec_labels.py
+@@ -0,0 +1,46 @@
++"""Offline codec targets in the same `utt_id z1 z2 ...` format as dump_labels.py (one file per codebook).
++
++Cost: one forward pass of a small frozen codec over the corpus (~hours on one GPU for 960 h) vs
++feature dump + k-means fit + label dump (+ a 2nd iteration with a pretrained HuBERT).
++Use --train-hubert ... --label-paths codec_q0.km codec_q1.km ... --num-classes 1024,1024,...
++"""
++import pathlib
++from argparse import ArgumentParser
++
++import torch
++import torchaudio
++
++from src.codec import build_codec
++from src.data.hubert_transforms import librispeech_utt_id, waveform_16k
++
++
++def run_dump(args):
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    extractor = build_codec(args.codec, args.num_q).to(device)
++    args.out_dir.mkdir(parents=True, exist_ok=True)
++    handles = [open(args.out_dir / f"codec_q{q}.km", "w", encoding="utf-8") for q in range(args.num_q)]
++    for subset in args.subsets:
++        ds = torchaudio.datasets.LIBRISPEECH(str(args.librispeech_path), url=subset, download=False)
++        for sample in ds:
++            wav = waveform_16k(sample).to(device)[None]
++            codes = extractor(wav, torch.tensor([wav.numel()], device=device))
++            utt = librispeech_utt_id(sample)
++            for q, c in enumerate(codes):
++                handles[q].write(utt + " " + " ".join(map(str, c[0].tolist())) + "\n")
++
++    for h in handles:
++        h.close()
++
++
++def cli_main():
++    p = ArgumentParser()
++    p.add_argument("--librispeech-path", type=pathlib.Path, required=True)
++    p.add_argument("--subsets", nargs="+", default=["train-clean-100", "train-clean-360", "train-other-500", "dev-clean", "dev-other"])
++    p.add_argument("--codec", default="dac-16khz")
++    p.add_argument("--num-q", type=int, default=4)
++    p.add_argument("--out-dir", type=pathlib.Path, required=True)
++    run_dump(p.parse_args())
++
++
++if __name__ == "__main__":
++    cli_main()
+diff --git a/experiments/hubert_train/test/test_codec_targets.py b/experiments/hubert_train/test/test_codec_targets.py
+new file mode 100644
+index 0000000..26b5f78
+--- /dev/null
++++ b/experiments/hubert_train/test/test_codec_targets.py
+@@ -0,0 +1,77 @@
++import unittest
++
++import torch
++import torch.nn.functional as F
++
++from src.codec import build_codec
++from src.models.hubert.config import get_hubert_config
++from src.models.hubert.hubert_model import HubertModel
++from src.models.hubert.masking import compute_span_mask
++from src.models.hubert.prediction_head import HubertPredictionHead
++
++
++class TestEfficientHead(unittest.TestCase):
++    def test_matmul_logits_equal_cosine_similarity(self):
++        head = HubertPredictionHead(32, 16, [64], logit_temp=0.1)
++        h = torch.randn(3, 7, 32)
++        proj = head.projections[0](h)
++        ref = F.cosine_similarity(proj.unsqueeze(-2), head.label_embs[0].unsqueeze(0), dim=-1) / 0.1
++        self.assertTrue(torch.allclose(head.logits(h), ref, atol=1e-4))
++
++
++class TestVectorisedMask(unittest.TestCase):
++    def test_invariants(self):
++        torch.manual_seed(0)
++        lengths = torch.tensor([200, 150, 60, 1, 12])
++        for _ in range(50):
++            m = compute_span_mask(lengths, 0.08, 10, 2)
++            for i, n in enumerate(lengths.tolist()):
++                self.assertFalse(m[i, n:].any())
++                if n > 1:
++                    self.assertTrue(m[i, :n].any())
++                    self.assertFalse(m[i, :n].all())
++
++    def test_ratio_close_to_hubert(self):
++        torch.manual_seed(0)
++        m = compute_span_mask(torch.full((256,), 400), 0.08, 10, 2).float().mean().item()
++        self.assertTrue(0.50 < m < 0.60, m)  # 1-(1-0.08)^10 ~= 0.57; matches the previous loop implementation
++
++
++class TestCodecPretrain(unittest.TestCase):
++    def test_multi_head_weighted_loss_and_curriculum(self):
++        torch.manual_seed(0)
++        ext = build_codec("stub", 3)
++        cfg = get_hubert_config("tiny", num_classes=[ext.codebook_size] * 3, label_rate=50.0)
++        cfg.codebook_weights = [1.0, 0.5, 0.25]
++        model = HubertModel(cfg)
++        src = torch.randn(2, 16000)
++        lengths = torch.tensor([16000, 12000])
++        out = model(src, lengths, ext(src, lengths))
++        self.assertEqual(len(out["logit_m_list"]), 3)
++        loss = model.masked_prediction_loss(out)
++        loss.backward()
++        self.assertTrue(torch.isfinite(loss))
++        model.active_heads = 1
++        out = model(src, lengths, ext(src, lengths))
++        self.assertEqual(len(out["logit_m_list"]), 1)
++        self.assertTrue(torch.isfinite(model.masked_prediction_loss(out)))
++
++    def test_overfits_codec_targets(self):
++        torch.manual_seed(0)
++        ext = build_codec("stub", 1)
++        cfg = get_hubert_config("tiny", num_classes=[ext.codebook_size], label_rate=50.0)
++        model = HubertModel(cfg)
++        opt = torch.optim.Adam(model.parameters(), 1e-3)
++        src = torch.randn(4, 8000)
++        lengths = torch.full((4,), 8000)
++        tg = ext(src, lengths)
++        first = None
++        for _ in range(60):
++            loss = model.masked_prediction_loss(model(src, lengths, tg))
++            opt.zero_grad(); loss.backward(); opt.step()
++            first = first if first is not None else loss.item()
++        self.assertLess(loss.item(), first)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/experiments/hubert_train/train_hubert.py b/experiments/hubert_train/train_hubert.py
+index 68ad847..03ab032 100644
+--- a/experiments/hubert_train/train_hubert.py
++++ b/experiments/hubert_train/train_hubert.py
+@@ -57,6 +57,7 @@ def run_train(args):
+         callbacks=callbacks,
+         reload_dataloaders_every_n_epochs=0,
+         gradient_clip_val=0.0,
++        precision=args.precision,
+         limit_train_batches=(50 if args.sanity_check else None),
+         limit_val_batches=(10 if args.sanity_check else None),
+         accumulate_grad_batches=args.accumulate_grad_batches,
+@@ -71,7 +72,8 @@ def run_train(args):
+     trainer = Trainer(**trainer_kwargs)
+ 
+     model = HubertPretrainModule(args)
+-    dummy = bool(args.sanity_check and not args.label_paths)
++    online = args.targets == "codec-online"
++    dummy = bool(args.sanity_check and not args.label_paths and not online)
+     data_module = get_hubert_pretrain_data_module(
+         str(args.librispeech_path),
+         label_paths=[str(p) for p in args.label_paths] if args.label_paths else None,
+@@ -84,6 +86,7 @@ def run_train(args):
+         else None,
+         num_workers=args.num_workers,
+         max_batch_duration=float(args.max_batch_duration),
++        online_targets=online,
+         )
+     trainer.fit(model, data_module, ckpt_path=args.checkpoint_path)
+ 
+@@ -144,6 +147,26 @@ def cli_main():
+         type=float,
+         help="Weight of masked-frame loss. 1.0 is masked-only. (Default: 1.0)",
+     )
++    parser.add_argument(
++        "--targets",
++        default="kmeans",
++        choices=["kmeans", "codec-online"],
++        help="kmeans: --label-paths .km files (also codec dumped offline); codec-online: frozen codec RVQ indices computed on GPU, nothing stored on disk.",
++    )
++    parser.add_argument("--codec", default="dac-16khz", help="Codec for --targets codec-online (dac-16khz | stub).")
++    parser.add_argument("--codec-num-q", default=4, type=int, help="Number of RVQ levels used as targets. (Default: 4)")
++    parser.add_argument(
++        "--codebook-weights",
++        default=None,
++        help="Comma-separated loss weight per head, e.g. '1,0.5,0.25,0.125' (coarse levels matter most).",
++    )
++    parser.add_argument(
++        "--q-curriculum-steps",
++        default=0,
++        type=int,
++        help="If >0: coarse-to-fine, add one codebook head every N steps. (Default: 0 = all heads)",
++    )
++    parser.add_argument("--precision", default="32-true", help="Trainer precision, e.g. bf16-mixed. (Default: 32-true)")
+     parser.add_argument(
+         "--lr",
+         default=5e-4,
+diff --git a/src/codec/__init__.py b/src/codec/__init__.py
+new file mode 100644
+index 0000000..f3a213f
+--- /dev/null
++++ b/src/codec/__init__.py
+@@ -0,0 +1,3 @@
++from src.codec.targets import CodecTargetExtractor, StubCodec, build_codec
++
++__all__ = ["CodecTargetExtractor", "StubCodec", "build_codec"]
+diff --git a/src/codec/targets.py b/src/codec/targets.py
+new file mode 100644
+index 0000000..14be090
+--- /dev/null
++++ b/src/codec/targets.py
+@@ -0,0 +1,102 @@
++"""Frozen neural-codec RVQ indices as HuBERT masked-prediction targets.
++
++Replaces the k-means stage (MFCC k-means -> layer-6 k-means -> ...) with the codebook
++indices of a pretrained RVQ codec: no feature dump to disk, no clustering iterations.
++
++HuBERT's CNN has a 320x stride at 16 kHz = 50 Hz. DAC-16kHz (hop 320, 12 x 1024 RVQ)
++matches it exactly, so no target resampling is needed. Codecs with another frame rate
++(EnCodec-24k: 75 Hz, Mimi: 12.5 Hz) are resampled in time by nearest-neighbour
++interpolation of the *indices* (never of embeddings).
++"""
++from typing import List, Optional
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++
++class CodecTargetExtractor(nn.Module):
++    """codec: object with .encode_codes(wav[B,1,T]) -> LongTensor[B,Q,Tc]; sample_rate, frame_rate, codebook_size."""
++
++    def __init__(self, codec, num_q: int, target_rate: float = 50.0):
++        super().__init__()
++        self.codec = codec
++        self.num_q = num_q
++        self.target_rate = target_rate
++        for p in self.codec.parameters():
++            p.requires_grad = False
++
++        self.codec.eval()
++
++    @property
++    def codebook_size(self) -> int:
++        return self.codec.codebook_size
++
++    def train(self, mode: bool = True):  # codec always stays in eval mode
++        return super().train(False)
++
++    @torch.no_grad()
++    def forward(self, wav: torch.Tensor, lengths: torch.Tensor) -> List[torch.Tensor]:
++        """wav: [B, T] at 16 kHz (HuBERT input). Returns Q tensors [B, T_label] (long)."""
++        x = wav.unsqueeze(1)
++        if self.codec.sample_rate != 16000:
++            import torchaudio
++
++            x = torchaudio.functional.resample(x, 16000, self.codec.sample_rate)
++
++        codes = self.codec.encode_codes(x)[:, : self.num_q]  # [B, Q, Tc]
++        if abs(self.codec.frame_rate - self.target_rate) > 1e-6:
++            n_out = int(round(codes.size(-1) * self.target_rate / self.codec.frame_rate))
++            idx = (torch.arange(n_out, device=codes.device) * self.codec.frame_rate / self.target_rate).long()
++            codes = codes.index_select(-1, idx.clamp(max=codes.size(-1) - 1))
++
++        return [codes[:, q].contiguous() for q in range(codes.size(1))]
++
++
++class DACCodec(nn.Module):
++    """descript-audio-codec wrapper (pip install descript-audio-codec). 16 kHz model: 50 Hz, 12 x 1024."""
++
++    def __init__(self, model_type: str = "16khz"):
++        super().__init__()
++        import dac
++
++        self.model = dac.DAC.load(dac.utils.download(model_type=model_type))
++        self.sample_rate = int(self.model.sample_rate)
++        self.frame_rate = self.sample_rate / int(self.model.hop_length)
++        self.codebook_size = int(self.model.codebook_size)
++
++    @torch.no_grad()
++    def encode_codes(self, wav: torch.Tensor) -> torch.Tensor:
++        wav = self.model.preprocess(wav, self.sample_rate)
++        _, codes, *_ = self.model.encode(wav)
++        return codes.long()
++
++
++class StubCodec(nn.Module):
++    """Dependency-free stand-in for tests / CPU smoke runs: strided-frame hash -> RVQ-like indices."""
++
++    def __init__(self, num_q: int = 4, codebook_size: int = 1024, hop: int = 320):
++        super().__init__()
++        self.sample_rate, self.hop, self.codebook_size = 16000, hop, codebook_size
++        self.frame_rate = 16000 / hop
++        self.num_q = num_q
++        self.register_buffer("proj", torch.randn(num_q, hop))
++
++    @torch.no_grad()
++    def encode_codes(self, wav: torch.Tensor) -> torch.Tensor:
++        x = wav.squeeze(1)
++        n = x.size(-1) // self.hop
++        frames = x[:, : n * self.hop].reshape(x.size(0), n, self.hop)
++        score = torch.einsum("bth,qh->bqt", frames, self.proj)
++        return ((score * 1e3).long() % self.codebook_size).abs()
++
++
++def build_codec(name: str, num_q: int, target_rate: float = 50.0) -> CodecTargetExtractor:
++    if name == "stub":
++        codec = StubCodec(num_q=num_q)
++    elif name.startswith("dac"):
++        codec = DACCodec(name.split("-", 1)[1] if "-" in name else "16khz")
++    else:
++        raise ValueError(f"unknown codec '{name}' (supported: dac-16khz, dac-24khz, stub; add Mimi/EnCodec wrappers here)")
++
++    return CodecTargetExtractor(codec, num_q=num_q, target_rate=target_rate)
+diff --git a/src/data/hubert_data_module.py b/src/data/hubert_data_module.py
+index 37f3dc4..af0c83c 100644
+--- a/src/data/hubert_data_module.py
++++ b/src/data/hubert_data_module.py
+@@ -5,6 +5,7 @@ from src.data.hubert_transforms import (
+     HubertFinetuneTestTransform,
+     HubertFinetuneTransform,
+     HubertPretrainTransform,
++    WaveOnlyPretrainTransform,
+     load_km_file,
+ )
+ from src.data.librispeech_data_module import LibriSpeechDataModule
+@@ -34,8 +35,11 @@ def get_hubert_pretrain_data_module(
+     max_batch_duration=87.5,
+     min_duration=0.1,
+     max_duration=20.0,
++    online_targets=False,
+ ):
+-    if dummy_labels:
++    if online_targets:
++        transform = WaveOnlyPretrainTransform()
++    elif dummy_labels:
+         if num_classes is None:
+             num_classes = [100]
+         transform = DummyHubertPretrainTransform(num_classes=num_classes, label_rate=label_rate)
+diff --git a/src/data/hubert_transforms.py b/src/data/hubert_transforms.py
+index bff38b7..35e322c 100644
+--- a/src/data/hubert_transforms.py
++++ b/src/data/hubert_transforms.py
+@@ -135,3 +135,17 @@ class HubertFinetuneTestTransform:
+ 
+     def __call__(self, sample):
+         return self.inner([sample]), [sample]
++
++
++class WaveOnlyPretrainTransform:
++    """Online-codec mode: the dataloader returns audio only, targets are produced on GPU
++    by the frozen codec inside the LightningModule (nothing is stored on disk)."""
++
++    def __init__(self, sample_rate: int = 16000):
++        self.sample_rate = sample_rate
++
++    def __call__(self, samples: List):
++        waves = [waveform_16k(sample, self.sample_rate) for sample in samples]
++        lengths = torch.tensor([w.numel() for w in waves], dtype=torch.long)
++        inputs = torch.nn.utils.rnn.pad_sequence(waves, batch_first=True)
++        return HubertBatch(inputs, lengths, [], [])
+diff --git a/src/models/hubert/config.py b/src/models/hubert/config.py
+index 781c5d5..f3cc519 100644
+--- a/src/models/hubert/config.py
++++ b/src/models/hubert/config.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass, field
+-from typing import List, Tuple
++from typing import List, Optional, Tuple
+ 
+ 
+ @dataclass
+@@ -38,6 +38,8 @@ class HubertConfig:
+     label_rate: float = 50.0
+     mask_alpha: float = 1.0
+     feature_grad_mult: float = 1.0
++    # per-codebook loss weights (gamma_q in EnCodecMAE); None -> uniform
++    codebook_weights: Optional[List[float]] = None
+ 
+ 
+ def hubert_tiny(num_classes=None, label_rate=50.0, mask_alpha=1.0):
+diff --git a/src/models/hubert/hubert_model.py b/src/models/hubert/hubert_model.py
+index d5a3409..3acdfbb 100644
+--- a/src/models/hubert/hubert_model.py
++++ b/src/models/hubert/hubert_model.py
+@@ -64,6 +64,13 @@ class HubertModel(nn.Module):
+ 
+         self.feat2tar_ratio = cfg.label_rate * downsample / float(cfg.sample_rate)
+         self.mask_alpha = cfg.mask_alpha
++        n_heads = len(cfg.num_classes)
++        weights = cfg.codebook_weights or [1.0] * n_heads
++        assert len(weights) == n_heads, "codebook_weights must match num_classes"
++        w = torch.tensor(weights, dtype=torch.float32)
++        self.register_buffer("codebook_weights", w / w.sum(), persistent=False)
++        # number of heads currently trained (coarse-to-fine curriculum sets this < n_heads)
++        self.active_heads = n_heads
+         self.feature_grad_mult = cfg.feature_grad_mult
+ 
+     def forward_features(self, source: torch.Tensor) -> torch.Tensor:
+@@ -174,12 +181,17 @@ class HubertModel(nn.Module):
+         logit_u_list = []
+         target_m_list = []
+         target_u_list = []
+-        for k, targets in enumerate(target_list):
+-            logits = self.pred_head.logits(encoded, k)
+-            logit_m_list.append(logits[masked])
+-            logit_u_list.append(logits[unmasked])
++        # project only the frames that enter the loss (masked, and unmasked if alpha < 1)
++        need_unmasked = self.mask_alpha < 1
++        for k, targets in enumerate(target_list[: self.active_heads]):
++            logit_m_list.append(self.pred_head.logits(encoded[masked], k))
+             target_m_list.append(targets[masked])
+-            target_u_list.append(targets[unmasked])
++            if need_unmasked:
++                logit_u_list.append(self.pred_head.logits(encoded[unmasked], k))
++                target_u_list.append(targets[unmasked])
++            else:
++                logit_u_list.append(encoded.new_zeros(0, self.cfg.num_classes[k]))
++                target_u_list.append(targets.new_zeros(0))
+ 
+         return {
+             "logit_m_list": logit_m_list,
+@@ -195,22 +207,24 @@ class HubertModel(nn.Module):
+     def masked_prediction_loss(self, net_output: Dict[str, torch.Tensor]) -> torch.Tensor:
+         alpha = self.mask_alpha
+         losses = []
+-        for logit_m, target_m, logit_u, target_u in zip(
++        for k, (logit_m, target_m, logit_u, target_u) in enumerate(zip(
+             net_output["logit_m_list"],
+             net_output["target_m_list"],
+             net_output["logit_u_list"],
+             net_output["target_u_list"],
+-        ):
++        )):
+             loss = logit_m.new_zeros(())
+             if alpha > 0 and logit_m.numel() > 0:
+                 loss = loss + alpha * nn.functional.cross_entropy(logit_m.float(), target_m.long())
+             if alpha < 1 and logit_u.numel() > 0:
+                 loss = loss + (1.0 - alpha) * nn.functional.cross_entropy(logit_u.float(), target_u.long())
+ 
+-            losses.append(loss)
++            losses.append(loss * self.codebook_weights[k])
+ 
+-        stacked = torch.stack(losses) if losses else torch.zeros((), device=self.mask_emb.device)
+-        return stacked.mean()
++        if not losses:
++            return torch.zeros((), device=self.mask_emb.device)
++        # weights are normalised over all heads; renormalise over the active ones
++        return torch.stack(losses).sum() / self.codebook_weights[: len(losses)].sum()
+ 
+     def remove_pretraining_modules(self):
+         self.pred_head = None
+diff --git a/src/models/hubert/masking.py b/src/models/hubert/masking.py
+index 21a3f97..3cea1a5 100644
+--- a/src/models/hubert/masking.py
++++ b/src/models/hubert/masking.py
+@@ -7,6 +7,12 @@ def compute_span_mask(
+     mask_length: int,
+     min_masks: int = 2,
+ ):
++    """Vectorised HuBERT span masking (no python loop over the batch).
++
++    Same semantics as before: per utterance sample ~mask_prob*len span starts
++    (without replacement, at least min_masks), mask `mask_length` frames from each
++    start, guarantee at least one masked and at least one unmasked frame.
++    """
+     batch_size = lengths.size(0)
+     max_len = int(lengths.max().item()) if lengths.numel() else 0
+     device = lengths.device
+@@ -14,29 +20,34 @@ def compute_span_mask(
+     if max_len == 0 or mask_length < 1:
+         return mask
+ 
+-    for i in range(batch_size):
+-        sz = int(lengths[i].item())
+-        if sz <= 1:
+-            continue
+-
+-        span = min(mask_length, sz)
+-        max_start = max(sz - span + 1, 1)
+-        num_starts = int(mask_prob * sz + torch.rand((), device=device).item())
+-        num_starts = max(min_masks, num_starts)
+-        num_starts = min(num_starts, max_start)
+-        starts = torch.randperm(max_start, device=device)[:num_starts]
+-
+-        for start in starts.tolist():
+-            end = min(start + span, sz)
+-            mask[i, start:end] = True
+-
+-        if not mask[i, :sz].any():
+-            start = int(torch.randint(0, max_start, (1,), device=device).item())
+-            mask[i, start : min(start + span, sz)] = True
+-
+-        if sz > 1 and bool(mask[i, :sz].all()):
+-            unmask_at = int(torch.randint(0, sz, (1,), device=device).item())
+-            mask[i, unmask_at] = False
++    lengths = lengths.to(device).long()
++    valid = lengths > 1
++    span = lengths.clamp(max=mask_length).clamp(min=1)
++    max_start = (lengths - span + 1).clamp(min=1)
++    num_starts = (mask_prob * lengths + torch.rand(batch_size, device=device)).long()
++    num_starts = torch.maximum(num_starts, torch.full_like(num_starts, min_masks))
++    num_starts = torch.minimum(num_starts, max_start)
++
++    # random distinct starts: rank random keys, keep the num_starts smallest that are < max_start
++    keys = torch.rand(batch_size, max_len, device=device)
++    pos = torch.arange(max_len, device=device).unsqueeze(0)
++    keys = keys.masked_fill(pos >= max_start.unsqueeze(1), float("inf"))
++    rank = keys.argsort(dim=1).argsort(dim=1)
++    is_start = (rank < num_starts.unsqueeze(1)) & (pos < max_start.unsqueeze(1))
++
++    # dilate starts into spans (mask_length shifted ORs, ~10 cheap ops)
++    out = torch.zeros_like(is_start)
++    for k in range(int(span.max().item())):
++        shifted = torch.nn.functional.pad(is_start, (k, 0))[:, :max_len]
++        out |= shifted & (k < span).unsqueeze(1)
++    mask = out & (pos < lengths.unsqueeze(1)) & valid.unsqueeze(1)
++
++    # guarantee: never all-masked
++    all_masked = valid & (mask.sum(1) >= lengths)
++    if all_masked.any():
++        unmask_at = (torch.rand(batch_size, device=device) * lengths).long().clamp(max=max_len - 1)
++        rows = all_masked.nonzero(as_tuple=True)[0]
++        mask[rows, unmask_at[rows]] = False
+ 
+     return mask
+ 
+diff --git a/src/models/hubert/prediction_head.py b/src/models/hubert/prediction_head.py
+index 5dfda0a..1d8e4fb 100644
+--- a/src/models/hubert/prediction_head.py
++++ b/src/models/hubert/prediction_head.py
+@@ -1,4 +1,4 @@
+-from typing import List
++from typing import List, Optional
+ 
+ import torch
+ import torch.nn as nn
+@@ -22,14 +22,13 @@ class HubertPredictionHead(nn.Module):
+         self.label_embs = nn.ParameterList(embeddings)
+ 
+     def logits(self, hidden: torch.Tensor, codebook_index: int = 0) -> torch.Tensor:
+-        projected = self.projections[codebook_index](hidden)
+-        codes = self.label_embs[codebook_index]
+-        sim = F.cosine_similarity(
+-            projected.unsqueeze(-2).float(),
+-            codes.unsqueeze(0).float(),
+-            dim=-1,
+-        )
+-        return sim / self.logit_temp
++        # cosine similarity as a matmul of L2-normalised tensors: the old
++        # F.cosine_similarity on [.., 1, D] x [1, K, D] materialised a [N, K, D]
++        # tensor (~4.6 GB per head for K=1024, D=256 at 87.5 s of audio).
++        # hidden may be [B, T, E] or already-selected [N, E].
++        projected = F.normalize(self.projections[codebook_index](hidden).float(), dim=-1)
++        codes = F.normalize(self.label_embs[codebook_index].float(), dim=-1)
++        return (projected @ codes.t()) / self.logit_temp
+ 
+     def forward(self, hidden: torch.Tensor) -> List[torch.Tensor]:
+         return [self.logits(hidden, i) for i in range(len(self.num_classes))]
+diff --git a/src/models/hubert_lightning_module.py b/src/models/hubert_lightning_module.py
+index de99e79..c0fa6c4 100644
+--- a/src/models/hubert_lightning_module.py
++++ b/src/models/hubert_lightning_module.py
+@@ -1,9 +1,11 @@
+ import itertools
++import time
+ 
+ import torch
+ from pytorch_lightning import LightningModule
+ from torchmetrics.text import WordErrorRate
+ 
++from src.codec import build_codec
+ from src.models.hubert.config import get_hubert_config
+ from src.models.hubert.hubert_model import HubertModel
+ from src.opt.schedulers import LinearWarmupDecayScheduler, NoamAnnealing
+@@ -17,14 +19,26 @@ class HubertPretrainModule(LightningModule):
+         self.save_hyperparameters(args)
+         self.args = args
+         num_classes = [int(v) for v in str(args.num_classes).split(",") if str(v).strip()]
+-        self.model = HubertModel(
+-            get_hubert_config(
+-                args.model_size,
+-                num_classes=num_classes,
+-                label_rate=float(args.label_rate),
+-                mask_alpha=float(args.mask_alpha),
+-            )
++        self.targets_mode = getattr(args, "targets", "kmeans")  # kmeans | codec-online
++        self.q_curriculum_steps = int(getattr(args, "q_curriculum_steps", 0))
++        self._codec_holder = []  # frozen codec lives outside state_dict / optimizer / DDP
++        if self.targets_mode == "codec-online":
++            codec = build_codec(args.codec, int(args.codec_num_q), float(args.label_rate))
++            self._codec_holder.append(codec)
++            num_classes = [codec.codebook_size] * int(args.codec_num_q)
++
++        cfg = get_hubert_config(
++            args.model_size,
++            num_classes=num_classes,
++            label_rate=float(args.label_rate),
++            mask_alpha=float(args.mask_alpha),
+         )
++        cb_w = getattr(args, "codebook_weights", None)
++        if cb_w:
++            cfg.codebook_weights = [float(v) for v in str(cb_w).split(",")]
++
++        self.model = HubertModel(cfg)
++        self._t_last = None
+         self.optimizer = torch.optim.Adam(
+             self.model.parameters(),
+             lr=float(args.lr),
+@@ -33,14 +47,31 @@ class HubertPretrainModule(LightningModule):
+             weight_decay=float(args.weight_decay),
+         )
+ 
++    def _targets(self, batch):
++        if self.targets_mode != "codec-online":
++            return list(batch.targets)
++
++        codec = self._codec_holder[0]
++        if next(codec.parameters()).device != batch.inputs.device:
++            codec.to(batch.inputs.device)
++
++        return codec(batch.inputs, batch.input_lengths)
++
++    def _update_curriculum(self):
++        # coarse-to-fine: first codebook only, then add one RVQ level every q_curriculum_steps
++        n = len(self.model.cfg.num_classes)
++        if self.q_curriculum_steps > 0:
++            self.model.active_heads = min(n, 1 + self.global_step // self.q_curriculum_steps)
++
+     def _step(self, batch, step_type):
+         if batch is None:
+             return None
+ 
++        self._update_curriculum()
+         net_output = self.model(
+             source=batch.inputs,
+             lengths=batch.input_lengths,
+-            target_list=list(batch.targets),
++            target_list=self._targets(batch),
+             mask=True,
+         )
+         loss = self.model.masked_prediction_loss(net_output)
+@@ -54,15 +85,36 @@ class HubertPretrainModule(LightningModule):
+             on_step=True,
+             on_epoch=False,
+         )
+-        if net_output["logit_m_list"] and net_output["logit_m_list"][0].numel() > 0:
+-            acc = (
+-                net_output["logit_m_list"][0].argmax(dim=-1)
+-                == net_output["target_m_list"][0]
+-            ).float().mean()
+-            self.log(f"Metrics/{step_type}_masked_acc", acc, on_epoch=True, sync_dist=True)
++        with torch.no_grad():
++            # per-codebook masked accuracy + target perplexity (collapse / usefulness of each RVQ level)
++            for k, (lg, tg) in enumerate(zip(net_output["logit_m_list"], net_output["target_m_list"])):
++                if lg.numel() == 0:
++                    continue
++
++                self.log(f"Metrics/{step_type}_masked_acc_q{k}", (lg.argmax(-1) == tg).float().mean(),
++                         on_epoch=True, sync_dist=True)
++                if step_type == "val":
++                    p = torch.bincount(tg.long(), minlength=lg.size(-1)).float()
++                    p = p / p.sum().clamp_min(1.0)
++                    ppl = torch.exp(-(p * torch.log(p.clamp_min(1e-12))).sum())
++                    self.log(f"Metrics/val_target_perplexity_q{k}", ppl, on_epoch=True, sync_dist=True)
+ 
+         return loss
+ 
++    def on_train_batch_end(self, outputs, batch, batch_idx):
++        # throughput: seconds of audio processed per wall-second (the number the efficiency paper reports)
++        if batch is None:
++            return
++
++        now = time.perf_counter()
++        if self._t_last is not None:
++            audio_s = float(batch.input_lengths.sum().item()) / 16000.0
++            self.log("Perf/audio_sec_per_sec", audio_s / max(now - self._t_last, 1e-9), on_step=True, on_epoch=False)
++            if torch.cuda.is_available():
++                self.log("Perf/peak_mem_gb", torch.cuda.max_memory_allocated() / 2**30, on_step=True, on_epoch=False)
++
++        self._t_last = now
++
+     def training_step(self, batch, batch_idx):
+         loss = self._step(batch, "train")
+ 
