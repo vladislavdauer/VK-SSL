@@ -8,8 +8,9 @@ import torchaudio
 from tqdm import tqdm
 
 from src.data.hubert_transforms import librispeech_utt_id, waveform_16k
-from src.models.hubert.config import get_hubert_config
-from src.models.hubert.hubert_model import HubertModel
+from src.models.hubert.config import HUBERT_SIZES, get_hubert_config
+from src.models.hubert.ger import effective_rank
+from src.models.hubert.hubert_model import HubertModel, load_encoder_state
 
 def _load_encoder(args):
     num_classes = [int(v) for v in str(args.num_classes).split(",") if str(v).strip()]
@@ -20,18 +21,10 @@ def _load_encoder(args):
             label_rate=float(args.label_rate),
         )
     )
-    ckpt = torch.load(args.checkpoint_path, map_location="cpu")
-    state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    cleaned = {}
-    for key, value in state.items():
-        if key.startswith("model."):
-            cleaned[key[len("model.") :]] = value
-        elif key.startswith("encoder."):
-            cleaned[key[len("encoder.") :]] = value
-        else:
-            cleaned[key] = value
-
-    model.load_state_dict(cleaned, strict=False)
+    report = load_encoder_state(model, args.checkpoint_path)
+    tqdm.write(f"loaded {report['loaded']}/{report['expected']} encoder tensors from {report['path']}")
+    if args.layer is None:
+        args.layer = model.cfg.encoder_layers
     model.eval()
     if args.use_cuda and torch.cuda.is_available():
         model = model.cuda()
@@ -52,31 +45,6 @@ def _extract_hidden(model, sample, layer_1based: int):
 
     t = int(feat_lengths[0].item())
     return hidden[0, :t].detach().float().cpu()
-
-def effective_rank(matrix: torch.Tensor, eps: float = 1e-12) -> float:
-
-    if matrix.ndim != 2:
-        raise ValueError(f"expected 2D matrix, got {tuple(matrix.shape)}")
-
-    if matrix.numel() == 0:
-        return 0.0
-
-    x = matrix.double()
-    if x.size(0) < x.size(1):
-        gram = x @ x.T
-    else:
-        gram = x.T @ x
-
-    eigvals = torch.linalg.eigvalsh(gram).clamp_min(0.0)
-    singular = torch.sqrt(eigvals)
-    total = singular.sum()
-    if float(total) <= eps:
-        return 0.0
-
-    p = singular / total
-    p = p[p > eps]
-    entropy = -(p * torch.log(p)).sum()
-    return float(torch.exp(entropy).item())
 
 def collect_embeddings(args, model):
     frames = []
@@ -166,7 +134,7 @@ def cli_main():
     parser.add_argument(
         "--model-size",
         default="base",
-        choices=["tiny", "base", "large", "xlarge"],
+        choices=HUBERT_SIZES,
         help="Must match the checkpoint. (Default: base)",
     )
     parser.add_argument(
@@ -182,9 +150,12 @@ def cli_main():
     )
     parser.add_argument(
         "--layer",
-        default=12,
+        default=None,
         type=int,
-        help="1-based transformer layer. Paper uses 12 for ASR GER. (Default: 12)",
+        help=(
+            "1-based transformer layer. Paper uses the last layer (12 for base) for ASR GER. "
+            "(Default: last layer of --model-size)"
+        ),
     )
     parser.add_argument(
         "--subsets",

@@ -9,6 +9,7 @@ from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
 
 from src.data.hubert_data_module import get_hubert_finetune_data_module
+from src.models.hubert.config import HUBERT_SIZES
 from src.models.hubert_lightning_module import HubertCTCModule
 
 FT_PRESETS = {
@@ -19,6 +20,7 @@ FT_PRESETS = {
         warmup_steps=8000,
         hold_steps=32000,
         decay_steps=40000,
+        freeze_steps=10000,
         ft_mask_prob=0.065,
         batch_seconds=1600.0,
     ),
@@ -29,6 +31,18 @@ FT_PRESETS = {
         warmup_steps=8000,
         hold_steps=0,
         decay_steps=72000,
+        freeze_steps=10000,
+        ft_mask_prob=0.075,
+        batch_seconds=200.0,
+    ),
+    "10h-pt100h": dict(
+        train_subsets=["ll-10h"],
+        lr=5e-5,
+        max_steps=25000,
+        warmup_steps=2500,
+        hold_steps=10000,
+        decay_steps=12500,
+        freeze_steps=2000,
         ft_mask_prob=0.075,
         batch_seconds=200.0,
     ),
@@ -37,8 +51,10 @@ MAX_GPU_BATCH_SECONDS = 200.0
 
 def apply_preset(args):
     preset = FT_PRESETS[args.preset]
+    if getattr(args, "random_init", False) and getattr(args, "freeze_steps", None) is None:
+        args.freeze_steps = 0
     for key, value in preset.items():
-        if key != "batch_seconds" and getattr(args, key) is None:
+        if key != "batch_seconds" and getattr(args, key, None) is None:
             setattr(args, key, value)
 
     world = max(1, int(args.gpus) * int(args.nodes))
@@ -52,11 +68,20 @@ def apply_preset(args):
 
 def run_train(args):
     seed_everything(1)
+    if args.random_init and args.pretrained_path is not None:
+        raise ValueError("--random-init and --pretrained-path are mutually exclusive")
+    if not args.random_init and args.pretrained_path is None and not args.sanity_check:
+        raise ValueError(
+            "Pass --pretrained-path <pretrain.ckpt>, or --random-init for the no-pretraining baseline"
+        )
     args = apply_preset(args)
     accum = int(args.accumulate_grad_batches)
+    init = "random" if args.random_init else str(args.pretrained_path)
     print(
         f"preset={args.preset} subsets={args.train_subsets} lr={args.lr} steps={args.max_steps} "
-        f"batch={args.gpus * args.nodes}x{args.max_batch_duration:g}s x accum {accum}",
+        f"batch={args.gpus * args.nodes}x{args.max_batch_duration:g}s x accum {accum} "
+        f"model={args.model_size} init={init} freeze={args.freeze_steps} "
+        f"unfreeze={args.unfreeze_steps}",
         flush=True,
     )
 
@@ -104,7 +129,7 @@ def run_train(args):
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=0,
         precision="32-true",
-        gradient_clip_val=0.0,
+        gradient_clip_val=float(args.gradient_clip_val),
         limit_train_batches=(50 if args.sanity_check else None),
         limit_val_batches=(10 if args.sanity_check else None),
         accumulate_grad_batches=accum,
@@ -156,6 +181,14 @@ def cli_main():
         help="HuBERT pre-train checkpoint to initialize the encoder from.",
     )
     parser.add_argument(
+        "--random-init",
+        action="store_true",
+        help=(
+            "Baseline: no pre-trained checkpoint, encoder (CNN included) starts from random "
+            "weights and is trained end to end. Sets --freeze-steps 0 unless passed explicitly."
+        ),
+    )
+    parser.add_argument(
         "--exp-dir",
         default=pathlib.Path("./exp_hubert_ft"),
         type=pathlib.Path,
@@ -173,8 +206,10 @@ def cli_main():
         choices=list(FT_PRESETS),
         help=(
             "Labelled-data recipe: '100h' = train-clean-100, '10h' = Libri-Light 10h "
-            "(<librispeech-path>/librispeech_finetuning). Sets data, LR schedule, steps, "
-            "mask and batch; any flag passed explicitly wins. (Default: 100h)"
+            "(<librispeech-path>/librispeech_finetuning) with fairseq base_10h values, "
+            "'10h-pt100h' = Libri-Light 10h tuned for an encoder pre-trained on 100 h. "
+            "Sets data, LR schedule, steps, freeze, mask and batch; any flag passed "
+            "explicitly wins. (Default: 100h)"
         ),
     )
     parser.add_argument(
@@ -210,7 +245,7 @@ def cli_main():
     parser.add_argument(
         "--model-size",
         default="base",
-        choices=["tiny", "base", "large", "xlarge"],
+        choices=HUBERT_SIZES,
         help="HuBERT size. Must match the pre-train checkpoint. (Default: base)",
     )
     parser.add_argument(
@@ -234,31 +269,31 @@ def cli_main():
         "--lr",
         default=None,
         type=float,
-        help="Peak LR. (Preset: 100h 3e-5, 10h 2e-5)",
+        help="Peak LR. (Preset: 100h 3e-5, 10h 2e-5, 10h-pt100h 5e-5)",
     )
     parser.add_argument(
         "--max-steps",
         default=None,
         type=int,
-        help="Optimizer steps. (Preset: 100h 80000, 10h 25000)",
+        help="Optimizer steps. (Preset: 100h 80000, 10h 25000, 10h-pt100h 25000)",
     )
     parser.add_argument(
         "--warmup-steps",
         default=None,
         type=int,
-        help="Tri-stage warmup. (Preset: 8000 for both)",
+        help="Tri-stage warmup. (Preset: 100h 8000, 10h 8000, 10h-pt100h 2500)",
     )
     parser.add_argument(
         "--hold-steps",
         default=None,
         type=int,
-        help="Tri-stage hold at peak LR. (Preset: 100h 32000, 10h 0)",
+        help="Tri-stage hold at peak LR. (Preset: 100h 32000, 10h 0, 10h-pt100h 10000)",
     )
     parser.add_argument(
         "--decay-steps",
         default=None,
         type=int,
-        help="Tri-stage exponential decay. (Preset: 100h 40000, 10h 72000)",
+        help="Tri-stage exponential decay. (Preset: 100h 40000, 10h 72000, 10h-pt100h 12500)",
     )
     parser.add_argument(
         "--final-lr-scale",
@@ -268,9 +303,27 @@ def cli_main():
     )
     parser.add_argument(
         "--freeze-steps",
-        default=10000,
+        default=None,
         type=int,
-        help="Train only the CTC head for this many steps. (Default: 10000)",
+        help=(
+            "Train only the CTC head for this many steps. "
+            "(Preset: 100h 10000, 10h 10000, 10h-pt100h 2000; 0 with --random-init)"
+        ),
+    )
+    parser.add_argument(
+        "--unfreeze-steps",
+        default=0,
+        type=int,
+        help=(
+            "Gradual unfreeze after --freeze-steps: transformer layers are released top-down "
+            "over this many steps (input projection / pos-conv last). 0 = all at once. (Default: 0)"
+        ),
+    )
+    parser.add_argument(
+        "--gradient-clip-val",
+        default=0.0,
+        type=float,
+        help="Gradient norm clipping, 0 disables. (Default: 0.0)",
     )
     parser.add_argument(
         "--apply-ft-mask",

@@ -1,12 +1,14 @@
-import itertools
+import contextlib
 
 import torch
 from pytorch_lightning import LightningModule
+from pytorch_lightning.utilities import rank_zero_info
 from torchmetrics.text import WordErrorRate
 
 from src.data.hubert_transforms import HUBERT_LTR_VOCAB, decode_hubert_ltr
 from src.models.hubert.config import get_hubert_config
-from src.models.hubert.hubert_model import HubertModel
+from src.models.hubert.ger import effective_rank_from_gram
+from src.models.hubert.hubert_model import HubertModel, load_encoder_state
 from src.opt.schedulers import LinearWarmupDecayScheduler, TriStageLRScheduler
 
 _expected_spm_vocab_size = 128
@@ -34,6 +36,12 @@ class HubertPretrainModule(LightningModule):
             eps=1e-6,
             weight_decay=float(args.weight_decay),
         )
+        self.ger_layer = int(getattr(args, "ger_layer", None) or self.model.cfg.encoder_layers)
+        self.ger_max_seconds = float(getattr(args, "ger_max_seconds", 0.0) or 0.0)
+        if not 1 <= self.ger_layer <= self.model.cfg.encoder_layers:
+            raise ValueError(
+                f"--ger-layer must be in [1, {self.model.cfg.encoder_layers}], got {self.ger_layer}"
+            )
 
     def _step(self, batch, step_type):
         if batch is None:
@@ -79,7 +87,67 @@ class HubertPretrainModule(LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        return self._step(batch, "val")
+        loss = self._step(batch, "val")
+        self._ger_update(batch)
+        return loss
+
+    def _ger_reset(self):
+        dim = self.model.cfg.encoder_embed_dim
+        self._ger_gram = torch.zeros(dim, dim, dtype=torch.float64, device=self.device)
+        self._ger_utt_gram = torch.zeros_like(self._ger_gram)
+        self._ger_counts = torch.zeros(3, dtype=torch.float64, device=self.device)
+
+    def _ger_update(self, batch):
+        if self.ger_max_seconds <= 0 or batch is None:
+            return
+
+        world = self.trainer.world_size if self._trainer is not None else 1
+        if float(self._ger_counts[2]) >= self.ger_max_seconds / max(1, world):
+            return
+
+        with torch.no_grad():
+            hidden, _, padding_mask = self.model.extract_features(
+                batch.inputs, batch.input_lengths, tgt_layer=self.ger_layer - 1
+            )
+        valid = ~padding_mask
+        hidden = hidden.double()
+        frames = hidden[valid]
+        utterances = (hidden * valid.unsqueeze(-1)).sum(dim=1)
+        self._ger_gram += frames.T @ frames
+        self._ger_utt_gram += utterances.T @ utterances
+        seconds = float(batch.input_lengths.sum()) / float(self.model.cfg.sample_rate)
+        self._ger_counts += torch.tensor(
+            [frames.size(0), utterances.size(0), seconds],
+            dtype=torch.float64,
+            device=self._ger_counts.device,
+        )
+
+    def on_validation_epoch_start(self):
+        if self.ger_max_seconds > 0:
+            self._ger_reset()
+
+    def on_validation_epoch_end(self):
+        if self.ger_max_seconds <= 0 or self.trainer.sanity_checking:
+            return
+
+        strategy = self.trainer.strategy
+        gram = strategy.reduce(self._ger_gram, reduce_op="sum")
+        utt_gram = strategy.reduce(self._ger_utt_gram, reduce_op="sum")
+        counts = strategy.reduce(self._ger_counts, reduce_op="sum")
+        if float(counts[0]) <= 0:
+            return
+
+        ger = effective_rank_from_gram(gram)
+        rankme_t = effective_rank_from_gram(utt_gram)
+        self.log("Metrics/val_ger", ger, sync_dist=True)
+        self.log("Metrics/val_rankme_t", rankme_t, sync_dist=True)
+        if self.trainer.is_global_zero:
+            print(
+                f"[GER] epoch={self.current_epoch} step={self.global_step} layer={self.ger_layer} "
+                f"GER={ger:.2f} RankMe-t={rankme_t:.2f} frames={int(counts[0])} "
+                f"utts={int(counts[1])} audio={float(counts[2]) / 60.0:.1f}min",
+                flush=True,
+            )
 
     def configure_optimizers(self):
         if getattr(self.args, "max_steps", None):
@@ -100,9 +168,8 @@ class HubertPretrainModule(LightningModule):
         }
 
 class HubertCTCModule(LightningModule):
-    def __init__(self, args=None, sp_model=None):
+    def __init__(self, args=None, sp_model=None, load_pretrained=True):
         super().__init__()
-        self.save_hyperparameters(args)
         self.args = args
         self.sp_model = sp_model
         self.label_type = getattr(args, "label_type", "char")
@@ -125,11 +192,22 @@ class HubertCTCModule(LightningModule):
                 mask_alpha=float(args.mask_alpha),
             )
         )
-        if getattr(args, "pretrained_path", None):
-            self._load_pretrained(args.pretrained_path)
+        self.random_init = bool(getattr(args, "random_init", False))
+        pretrained_path = getattr(args, "pretrained_path", None)
+        if self.random_init and pretrained_path:
+            raise ValueError("random_init=True and pretrained_path are mutually exclusive")
+        if self.random_init:
+            rank_zero_info(
+                f"[init] encoder: random init ({args.model_size}), no pretrained checkpoint loaded; "
+                f"CNN feature extractor is trained"
+            )
+        elif load_pretrained and pretrained_path:
+            self._load_pretrained(pretrained_path)
+        self.save_hyperparameters(args)
 
         self.encoder.remove_pretraining_modules()
-        self.encoder.freeze_feature_extractor()
+        if not self.random_init:
+            self.encoder.freeze_feature_extractor()
         self.encoder.set_finetune_dropout(
             dropout=float(getattr(args, "dropout", 0.0)),
             attention_dropout=float(getattr(args, "attention_dropout", 0.0)),
@@ -146,57 +224,72 @@ class HubertCTCModule(LightningModule):
 
         self.loss = torch.nn.CTCLoss(blank=self.blank_idx, reduction="none", zero_infinity=True)
 
-        trainable = itertools.chain(
-            *[
-                [p for p in self.encoder.parameters() if p.requires_grad],
-                self.ctc_out.parameters(),
-            ]
-        )
+        trainable = [p for p in self.encoder.parameters() if p.requires_grad]
+        trainable += list(self.ctc_out.parameters())
         self.optimizer = torch.optim.Adam(
             trainable,
             lr=float(args.lr),
             betas=(0.9, 0.98),
             eps=1e-8,
         )
-        freeze_steps = int(getattr(args, "freeze_steps", 0))
-        if freeze_steps > 0:
-            self._set_transformer_frozen(True)
-        else:
-            self._frozen_transformer = False
+        # requires_grad is never toggled after this point: DDP only syncs parameters that
+        # require grad when it wraps the model, so freezing is done with no_grad / grad=None.
+        self.freeze_steps = int(getattr(args, "freeze_steps", 0) or 0)
+        self.unfreeze_steps = int(getattr(args, "unfreeze_steps", 0) or 0)
+        layers = self.encoder.encoder.layers
+        layer_param_ids = {id(p) for p in layers.parameters()}
+        self._unfreeze_groups = [
+            [
+                p
+                for p in self.encoder.parameters()
+                if p.requires_grad and id(p) not in layer_param_ids
+            ]
+        ] + [list(layer.parameters()) for layer in layers]
 
         self.train_wer = WordErrorRate()
         self.val_wer = WordErrorRate()
         self.test_wer = WordErrorRate()
 
     def _load_pretrained(self, path):
-        ckpt = torch.load(path, map_location="cpu")
-        state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-        cleaned = {}
-        for key, value in state.items():
-            if key.startswith("model."):
-                cleaned[key[len("model.") :]] = value
-            elif key.startswith("encoder."):
-                cleaned[key[len("encoder.") :]] = value
-            else:
-                cleaned[key] = value
+        report = load_encoder_state(self.encoder, path)
+        pt_hparams = report["hparams"]
+        pt_step = report["global_step"]
+        pt_max_steps = pt_hparams.get("max_steps")
+        progress = ""
+        if pt_step is not None and pt_max_steps:
+            progress = f" ({100.0 * pt_step / float(pt_max_steps):.1f}% of max_steps={pt_max_steps})"
+        rank_zero_info(
+            f"[init] encoder: loaded {report['loaded']}/{report['expected']} tensors from {path}; "
+            f"pretrain model_size={pt_hparams.get('model_size')} "
+            f"step={pt_step}{progress}; unexpected keys: {len(report['unexpected'])}"
+        )
+        if pt_step is not None and pt_max_steps and pt_step < 0.5 * float(pt_max_steps):
+            rank_zero_info(
+                f"[init] WARNING: pretrain checkpoint is at step {pt_step} of {pt_max_steps}; "
+                f"encoder is likely under-trained"
+            )
+        self.args.pretrained_loaded_tensors = int(report["loaded"])
+        self.args.pretrained_global_step = pt_step
 
-        missing, unexpected = self.encoder.load_state_dict(cleaned, strict=False)
-        _ = missing, unexpected
+    def _frozen_groups(self) -> int:
+        total = len(self._unfreeze_groups)
+        step = self.global_step
+        if step < self.freeze_steps:
+            return total
+        if self.unfreeze_steps <= 0:
+            return 0
 
-    def _set_transformer_frozen(self, frozen: bool):
-        for name, parameter in self.encoder.named_parameters():
-            if name.startswith("feature_extractor"):
-                parameter.requires_grad = False
-            else:
-                parameter.requires_grad = not frozen
+        progress = (step - self.freeze_steps) / float(self.unfreeze_steps)
+        if progress >= 1.0:
+            return 0
 
-        self._frozen_transformer = frozen
+        return total - 1 - int(progress * total)
 
-    def on_train_batch_start(self, batch, batch_idx):
-        freeze_steps = int(getattr(self.args, "freeze_steps", 0))
-        should_freeze = self.global_step < freeze_steps
-        if should_freeze != self._frozen_transformer:
-            self._set_transformer_frozen(should_freeze)
+    def on_before_optimizer_step(self, optimizer):
+        n_frozen = self._frozen_groups()
+        for group in self._unfreeze_groups[:n_frozen]:
+            for parameter in group:
+                parameter.grad = None
 
     def _decode_ids(self, token_ids):
         if self.label_type == "spm":
@@ -237,16 +330,18 @@ class HubertCTCModule(LightningModule):
             return None
 
         apply_mask = bool(getattr(self.args, "apply_ft_mask", True)) and step_type == "train"
-        encoded, src_lengths, _ = self.encoder.extract_features(
-            batch.inputs,
-            batch.input_lengths,
-            mask=apply_mask,
-            mask_prob=float(getattr(self.args, "ft_mask_prob", 0.065)),
-            mask_channel_prob=(
-                float(getattr(self.args, "ft_mask_channel_prob", 0.5)) if apply_mask else 0.0
-            ),
-            mask_channel_length=int(getattr(self.args, "ft_mask_channel_length", 64)),
-        )
+        frozen = step_type == "train" and self.global_step < self.freeze_steps
+        with torch.no_grad() if frozen else contextlib.nullcontext():
+            encoded, src_lengths, _ = self.encoder.extract_features(
+                batch.inputs,
+                batch.input_lengths,
+                mask=apply_mask,
+                mask_prob=float(getattr(self.args, "ft_mask_prob", 0.065)),
+                mask_channel_prob=(
+                    float(getattr(self.args, "ft_mask_channel_prob", 0.5)) if apply_mask else 0.0
+                ),
+                mask_channel_length=int(getattr(self.args, "ft_mask_channel_length", 64)),
+            )
 
         logits = self.ctc_out(self.final_dropout(encoded))
         probs = self.log_softmax(logits).transpose(0, 1)
@@ -316,6 +411,12 @@ class HubertCTCModule(LightningModule):
         loss = self._step(batch, "train")
 
         self.log("monitoring_step", torch.tensor(self.global_step, dtype=torch.float32))
+        self.log(
+            "Metrics/encoder_frozen_groups",
+            float(self._frozen_groups()),
+            on_step=True,
+            on_epoch=False,
+        )
 
         return loss
 

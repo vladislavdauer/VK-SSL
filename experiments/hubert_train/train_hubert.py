@@ -8,6 +8,7 @@ from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
 
 from src.data.hubert_data_module import get_hubert_pretrain_data_module
+from src.models.hubert.config import HUBERT_SIZES
 from src.models.hubert_lightning_module import HubertPretrainModule
 
 def run_train(args):
@@ -18,6 +19,7 @@ def run_train(args):
         monitor="Losses/val_loss",
         mode="min",
         save_top_k=5,
+        save_last=True,
         save_weights_only=False,
         verbose=True,
     )
@@ -136,8 +138,26 @@ def cli_main():
     parser.add_argument(
         "--model-size",
         default="base",
-        choices=["tiny", "base", "large", "xlarge"],
-        help="HuBERT size. (Default: base)",
+        choices=HUBERT_SIZES,
+        help="HuBERT size. 'small' = 8 x 512 (~32M params) for 100 h pre-training. (Default: base)",
+    )
+    parser.add_argument(
+        "--ger-layer",
+        default=None,
+        type=int,
+        help=(
+            "1-based transformer layer for the per-epoch GER / RankMe-t on validation audio "
+            "(Metrics/val_ger, Metrics/val_rankme_t). (Default: last layer)"
+        ),
+    )
+    parser.add_argument(
+        "--ger-max-seconds",
+        default=3600.0,
+        type=float,
+        help=(
+            "Validation audio (seconds, summed over GPUs) used for GER at the end of every "
+            "epoch; 0 disables. (Default: 3600, same budget as compute_ger.py)"
+        ),
     )
     parser.add_argument(
         "--num-classes",

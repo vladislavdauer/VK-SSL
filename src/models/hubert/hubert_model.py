@@ -262,3 +262,49 @@ class HubertModel(nn.Module):
             layer.dropout = dropout
             layer.activation_dropout = activation_dropout
             layer.self_attn.dropout = attention_dropout
+
+def load_encoder_state(model: HubertModel, path, skip_prefixes=("pred_head.",)) -> Dict:
+    ckpt = torch.load(path, map_location="cpu")
+    state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+    hparams = dict(ckpt.get("hyper_parameters", {}) or {}) if isinstance(ckpt, dict) else {}
+    cleaned = {}
+    for key, value in state.items():
+        if key.startswith("model."):
+            cleaned[key[len("model.") :]] = value
+        elif key.startswith("encoder."):
+            cleaned[key[len("encoder.") :]] = value
+        else:
+            cleaned[key] = value
+
+    own = model.state_dict()
+    expected = [k for k in own if not k.startswith(skip_prefixes)]
+    loadable, mismatched, unexpected = {}, [], []
+    for key, value in cleaned.items():
+        if key.startswith(skip_prefixes):
+            continue
+        if key not in own:
+            unexpected.append(key)
+        elif own[key].shape != value.shape:
+            mismatched.append(f"{key}: ckpt {tuple(value.shape)} vs model {tuple(own[key].shape)}")
+        else:
+            loadable[key] = value
+
+    missing = [k for k in expected if k not in loadable]
+    if mismatched or missing:
+        raise ValueError(
+            f"Checkpoint {path} does not match the encoder "
+            f"(ckpt model_size={hparams.get('model_size')!r}): "
+            f"{len(missing)} missing, {len(mismatched)} shape mismatches. "
+            f"First missing: {missing[:5]}; first mismatched: {mismatched[:3]}"
+        )
+
+    model.load_state_dict(loadable, strict=False)
+    return {
+        "path": str(path),
+        "loaded": len(loadable),
+        "expected": len(expected),
+        "unexpected": unexpected,
+        "hparams": hparams,
+        "global_step": ckpt.get("global_step") if isinstance(ckpt, dict) else None,
+        "epoch": ckpt.get("epoch") if isinstance(ckpt, dict) else None,
+    }

@@ -81,7 +81,9 @@ def run_eval(args):
 
         sp_model = spm.SentencePieceProcessor(model_file=str(args.sp_model_path))
 
-    model = HubertCTCModule.load_from_checkpoint(args.checkpoint_path, sp_model=sp_model).eval()
+    model = HubertCTCModule.load_from_checkpoint(
+        args.checkpoint_path, sp_model=sp_model, load_pretrained=False
+    ).eval()
     data_module = get_hubert_finetune_data_module(
         str(args.librispeech_path),
         sp_model_path=str(args.sp_model_path) if args.sp_model_path else None,

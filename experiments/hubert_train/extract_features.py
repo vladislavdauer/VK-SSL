@@ -9,8 +9,8 @@ from tqdm import tqdm
 
 from src.data.duration_cache import open_subset
 from src.data.hubert_transforms import librispeech_utt_id, waveform_16k
-from src.models.hubert.config import get_hubert_config
-from src.models.hubert.hubert_model import HubertModel
+from src.models.hubert.config import HUBERT_SIZES, get_hubert_config
+from src.models.hubert.hubert_model import HubertModel, load_encoder_state
 from src.models.hubert.kmeans import extract_mfcc_39
 
 class NpyStreamWriter:
@@ -70,16 +70,8 @@ def _load_encoder(args):
             label_rate=float(args.label_rate),
         )
     )
-    ckpt = torch.load(args.checkpoint_path, map_location="cpu")
-    state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    cleaned = {}
-    for key, value in state.items():
-        if key.startswith("model."):
-            cleaned[key[len("model.") :]] = value
-        else:
-            cleaned[key] = value
-
-    model.load_state_dict(cleaned, strict=False)
+    report = load_encoder_state(model, args.checkpoint_path)
+    tqdm.write(f"loaded {report['loaded']}/{report['expected']} encoder tensors from {report['path']}")
     model.eval()
     if args.use_cuda and torch.cuda.is_available():
         model = model.cuda()
@@ -172,7 +164,7 @@ def cli_main():
     parser.add_argument(
         "--model-size",
         default="base",
-        choices=["tiny", "base", "large", "xlarge"],
+        choices=HUBERT_SIZES,
         help="HuBERT size. Must match the checkpoint. (Default: base)",
     )
     parser.add_argument(

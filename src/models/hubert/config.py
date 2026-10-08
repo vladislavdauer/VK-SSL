@@ -75,6 +75,23 @@ def hubert_tiny(num_classes=None, label_rate=50.0, mask_alpha=1.0):
         min_masks=1,
     )
 
+def hubert_small(num_classes=None, label_rate=50.0, mask_alpha=1.0):
+    if num_classes is None:
+        num_classes = [100]
+
+    return HubertConfig(
+        encoder_layers=8,
+        encoder_embed_dim=512,
+        encoder_ffn_embed_dim=2048,
+        encoder_attention_heads=8,
+        layerdrop=0.05,
+        final_dim=256,
+        feature_grad_mult=0.1,
+        num_classes=list(num_classes),
+        label_rate=label_rate,
+        mask_alpha=mask_alpha,
+    )
+
 def hubert_base(num_classes=None, label_rate=50.0, mask_alpha=1.0):
     if num_classes is None:
         num_classes = [100]
@@ -127,6 +144,7 @@ def hubert_xlarge(num_classes=None, label_rate=50.0, mask_alpha=1.0):
 def get_hubert_config(name, num_classes=None, label_rate=50.0, mask_alpha=1.0, mask_prob=None):
     factories = {
         "tiny": hubert_tiny,
+        "small": hubert_small,
         "base": hubert_base,
         "large": hubert_large,
         "xlarge": hubert_xlarge,
@@ -139,3 +157,5 @@ def get_hubert_config(name, num_classes=None, label_rate=50.0, mask_alpha=1.0, m
         cfg.mask_prob = float(mask_prob)
 
     return cfg
+
+HUBERT_SIZES = ["tiny", "small", "base", "large", "xlarge"]
