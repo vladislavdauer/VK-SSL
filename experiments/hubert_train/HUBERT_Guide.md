@@ -230,6 +230,74 @@ Optional gradual unfreeze (top layer first, all layers released by step 2000 + 4
         --use-cuda
 ```
 
+## 6. UMAP of the `small` representations
+
+`umap_embeddings.py` embeds frames of 20 speakers × 10 utterances (100 random frames each,
+last layer by default) and projects them with UMAP (cosine). It accepts a pre-train
+checkpoint, a fine-tune checkpoint, or `--random-init` as a reference. `--model-size`,
+`--num-classes` and `--label-rate` are read from the checkpoint. Extra dependencies:
+`pip install umap-learn matplotlib`.
+
+Outputs in `--out-dir`:
+
+| File | Content |
+|---|---|
+| `umap_frames_speaker.png` | frames by speaker |
+| `umap_frames_teacher.png` | frames by iteration-1 MFCC k-means cluster (`--km-path km_100.bin`, or `--km-labels all.km`) |
+| `umap_frames_letter.png` | fine-tune checkpoints only: frames by reference letter, from CTC forced alignment of the transcript (`--letter-source greedy` = predictions) |
+| `umap_frames_phone.png` | only with `--phone-alignments` (frame-level, `<utt> id id ...` at `--phone-rate`) |
+| `umap_frames_emb_kmeans.png` | k-means on the embeddings themselves |
+| `umap_utterances_speaker.png` | mean-pooled utterances by speaker |
+| `umap_overview.png` | all panels |
+| `umap_meta.json` | init / checkpoint step, sizes, kNN label purity per colouring |
+| `umap_points.npz` | coordinates and labels (`--save-embeddings` adds raw frames) |
+
+Plot titles carry the kNN@10 label purity in the original space (same-utterance neighbours
+excluded) against chance. Use this number to compare runs; UMAP layouts are not comparable
+between runs. `librispeech_finetuning/phones/*.txt` are phone *sequences*, not frame alignments;
+the script detects the length mismatch and leaves those frames grey.
+
+Pre-trained (iteration 1), fine-tuned and random-init reference, on the same utterances (same `--seed`):
+
+```shell
+    PYTHONPATH=/home/vrdauer/VK-SSL python umap_embeddings.py \
+        --checkpoint-path /home/vrdauer/VK-SSL/experiments/hubert_train/exp_hubert_it1_100h_small/checkpoints/<best>.ckpt \
+        --librispeech-path /home/vrdauer/VK-SSL/experiments/ctc_train/librispeech \
+        --subsets ll-10h \
+        --km-path /home/vrdauer/VK-SSL/experiments/hubert_train/labels/mfcc_100h/km_100.bin \
+        --out-dir /home/vrdauer/VK-SSL/experiments/hubert_train/umap/small_it1_100h_ll10h \
+        --label "small it1 100h" \
+        --use-cuda
+```
+
+```shell
+    PYTHONPATH=/home/vrdauer/VK-SSL python umap_embeddings.py \
+        --checkpoint-path /home/vrdauer/VK-SSL/experiments/hubert_train/exp_hubert_ft10h_small/checkpoints/<best>.ckpt \
+        --librispeech-path /home/vrdauer/VK-SSL/experiments/ctc_train/librispeech \
+        --subsets ll-10h \
+        --km-path /home/vrdauer/VK-SSL/experiments/hubert_train/labels/mfcc_100h/km_100.bin \
+        --out-dir /home/vrdauer/VK-SSL/experiments/hubert_train/umap/small_ft10h_ll10h \
+        --label "small it1 100h + ft 10h" \
+        --use-cuda
+```
+
+```shell
+    PYTHONPATH=/home/vrdauer/VK-SSL python umap_embeddings.py \
+        --random-init \
+        --model-size small \
+        --librispeech-path /home/vrdauer/VK-SSL/experiments/ctc_train/librispeech \
+        --subsets ll-10h \
+        --km-path /home/vrdauer/VK-SSL/experiments/hubert_train/labels/mfcc_100h/km_100.bin \
+        --out-dir /home/vrdauer/VK-SSL/experiments/hubert_train/umap/small_random_init_ll10h \
+        --label "random init (no pre-training) reference"
+```
+
+`umap/small_random_init_ll10h/` holds the random-init reference, computed on CPU in about
+2 min. Its teacher is a k-means-100 fit on MFCCs of `ll-10h` (the section 2 commands with
+`--subsets ll-10h`), because `mfcc_100h/km_100.bin` is not available locally. The pre-train
+and fine-tune variants above need the `small` checkpoints. For held-out audio, use
+`--subsets dev-clean`, and add `--layer 4` for the layer used for iteration-2 labels.
+
 ## Reference
 
 ### Pre-train settings vs fairseq
