@@ -126,7 +126,8 @@ GER and RankMe-t (`compute_ger.py` metrics) are computed at the end of every epo
         --max-steps 100000 \
         --accumulate-grad-batches 4 \
         --ger-max-seconds 3600 \
-        --gpus 4
+        --gpus 4 \
+        --ger-min-steps 10000
 ```
 
 Resume after a job time limit (same command plus):
