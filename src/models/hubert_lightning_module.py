@@ -141,13 +141,6 @@ class HubertPretrainModule(LightningModule):
         rankme_t = effective_rank_from_gram(utt_gram)
         self.log("Metrics/val_ger", ger, sync_dist=True)
         self.log("Metrics/val_rankme_t", rankme_t, sync_dist=True)
-        if self.trainer.is_global_zero:
-            print(
-                f"[GER] epoch={self.current_epoch} step={self.global_step} layer={self.ger_layer} "
-                f"GER={ger:.2f} RankMe-t={rankme_t:.2f} frames={int(counts[0])} "
-                f"utts={int(counts[1])} audio={float(counts[2]) / 60.0:.1f}min",
-                flush=True,
-            )
 
     def configure_optimizers(self):
         if getattr(self.args, "max_steps", None):
