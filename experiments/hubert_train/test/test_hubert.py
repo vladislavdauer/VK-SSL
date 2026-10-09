@@ -1,9 +1,11 @@
 import argparse
+import csv
 import json
 import pickle
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -45,6 +47,24 @@ from src.models.hubert.masking import apply_mask, compute_channel_mask, compute_
 from src.models.hubert.prediction_head import HubertPredictionHead
 from src.models.hubert_lightning_module import HubertCTCModule, HubertPretrainModule
 from src.opt.schedulers import LinearWarmupDecayScheduler, TriStageLRScheduler
+
+def _ctc_batch():
+    return argparse.Namespace(
+        inputs=torch.randn(2, 6400),
+        input_lengths=torch.tensor([6400, 4800], dtype=torch.long),
+        targets=torch.tensor([[4, 5, 6], [7, 8, 27]], dtype=torch.long),
+        target_lengths=torch.tensor([3, 3], dtype=torch.long),
+    )
+
+def _fake_librispeech_batches(n_batches, batch_size, seconds=0.5, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    batches = []
+    for b in range(n_batches):
+        batches.append([
+            (torch.randn(1, int(16000 * seconds), generator=gen), 16000, "A B", 1, 2, b * batch_size + i)
+            for i in range(batch_size)
+        ])
+    return batches
 
 def _tiny_batch(batch_size=2, samples=3200, num_classes=16, label_rate=50.0):
     source = torch.randn(batch_size, samples)
@@ -392,13 +412,140 @@ class TestTrainingStep(unittest.TestCase):
             pretrained_path=None,
         )
         module = HubertCTCModule(args, FakeSP())
-        encoder_trainable = [
-            p.requires_grad
-            for n, p in module.encoder.named_parameters()
-            if not n.startswith("feature_extractor")
+        module.log = lambda *a, **k: None
+        transformer = [
+            p for n, p in module.encoder.named_parameters() if not n.startswith("feature_extractor")
         ]
-        self.assertTrue(encoder_trainable)
-        self.assertFalse(any(encoder_trainable))
+        self.assertTrue(transformer)
+        self.assertTrue(all(p.requires_grad for p in transformer))
+
+        batch = _ctc_batch()
+        with mock.patch.object(type(module), "global_step", new_callable=mock.PropertyMock, return_value=0):
+            module._step(batch, "train").backward()
+        self.assertTrue(all(p.grad is None for p in transformer))
+        self.assertIsNotNone(module.ctc_out.weight.grad)
+
+        module.zero_grad(set_to_none=True)
+        with mock.patch.object(type(module), "global_step", new_callable=mock.PropertyMock, return_value=5):
+            module._step(batch, "train").backward()
+        self.assertTrue(any(p.grad is not None for p in transformer))
+
+    def test_gradual_unfreeze_releases_layers_top_down(self):
+
+        args = argparse.Namespace(
+            model_size="tiny", num_classes="16", label_rate=50.0, mask_alpha=1.0, lr=1e-3,
+            freeze_steps=10, unfreeze_steps=30, warmup_steps=10, pretrained_path=None,
+        )
+        module = HubertCTCModule(args)
+        total = len(module._unfreeze_groups)
+        self.assertEqual(total, module.encoder.cfg.encoder_layers + 1)
+
+        def frozen_at(step):
+            with mock.patch.object(type(module), "global_step", new_callable=mock.PropertyMock, return_value=step):
+                return module._frozen_groups()
+
+        self.assertEqual(frozen_at(0), total)
+        self.assertEqual(frozen_at(10), total - 1)
+        self.assertEqual(frozen_at(39), 0)
+        self.assertEqual(frozen_at(40), 0)
+
+        for p in module.parameters():
+            p.grad = torch.ones_like(p)
+        with mock.patch.object(type(module), "global_step", new_callable=mock.PropertyMock, return_value=10):
+            module.on_before_optimizer_step(module.optimizer)
+        top = module._unfreeze_groups[-1]
+        bottom = module._unfreeze_groups[0]
+        self.assertTrue(all(p.grad is not None for p in top))
+        self.assertTrue(all(p.grad is None for p in bottom))
+        self.assertIsNotNone(module.ctc_out.weight.grad)
+
+class TestPretrainedInit(unittest.TestCase):
+    def _args(self, **over):
+        base = dict(
+            model_size="tiny", num_classes="16", label_rate=50.0, mask_alpha=1.0, lr=1e-3,
+            freeze_steps=0, warmup_steps=10, pretrained_path=None,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def _save_pretrain_ckpt(self, path, model_size="tiny", global_step=100, max_steps=1000):
+        torch.manual_seed(123)
+        module = HubertPretrainModule(argparse.Namespace(
+            model_size=model_size, num_classes="16", label_rate=50.0, mask_alpha=1.0,
+            lr=1e-3, weight_decay=0.0, warmup_ratio=0.08, max_steps=max_steps,
+        ))
+        torch.save(
+            {
+                "state_dict": module.state_dict(),
+                "hyper_parameters": {"model_size": model_size, "max_steps": max_steps},
+                "global_step": global_step,
+                "epoch": 3,
+            },
+            path,
+        )
+        return module
+
+    def test_pretrained_weights_are_loaded_and_reported(self):
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pt.ckpt"
+            pretrain = self._save_pretrain_ckpt(path)
+            module = HubertCTCModule(self._args(pretrained_path=path))
+        for name, value in module.encoder.state_dict().items():
+            self.assertTrue(torch.equal(value, pretrain.model.state_dict()[name]), name)
+        self.assertEqual(module.hparams.pretrained_global_step, 100)
+        self.assertEqual(
+            module.hparams.pretrained_loaded_tensors,
+            len([k for k in pretrain.model.state_dict() if not k.startswith("pred_head.")]),
+        )
+
+    def test_size_mismatch_raises_instead_of_silent_partial_load(self):
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pt.ckpt"
+            self._save_pretrain_ckpt(path, model_size="tiny")
+            with self.assertRaisesRegex(ValueError, "does not match the encoder"):
+                HubertCTCModule(self._args(model_size="small", pretrained_path=path))
+
+    def test_random_init_never_loads_a_checkpoint(self):
+
+        with mock.patch(
+            "src.models.hubert_lightning_module.load_encoder_state",
+            side_effect=AssertionError("pretrained weights must not be loaded"),
+        ):
+            module = HubertCTCModule(self._args(random_init=True))
+        self.assertTrue(module.random_init)
+        self.assertFalse(hasattr(module.hparams, "pretrained_global_step"))
+        self.assertTrue(all(p.requires_grad for p in module.encoder.feature_extractor.parameters()))
+        self.assertGreater(module.encoder.feature_grad_mult, 0.0)
+        cnn_ids = {id(p) for p in module.encoder.feature_extractor.parameters()}
+        opt_ids = {id(p) for g in module.optimizer.param_groups for p in g["params"]}
+        self.assertTrue(cnn_ids <= opt_ids)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pt.ckpt"
+            pretrain = self._save_pretrain_ckpt(path)
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                HubertCTCModule(self._args(random_init=True, pretrained_path=path))
+            torch.manual_seed(0)
+            scratch = HubertCTCModule(self._args(random_init=True))
+        pt_state = pretrain.model.state_dict()
+        differs = [
+            not torch.equal(v, pt_state[k])
+            for k, v in scratch.encoder.state_dict().items()
+            if k.endswith("weight") and v.dim() > 1
+        ]
+        self.assertTrue(all(differs))
+
+    def test_eval_reload_skips_pretrained_path(self):
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pt.ckpt"
+            self._save_pretrain_ckpt(path)
+            module = HubertCTCModule(self._args(pretrained_path=path))
+            path.unlink()
+            reloaded = HubertCTCModule(module.hparams, load_pretrained=False)
+        self.assertIsNotNone(reloaded)
 
 class TestFinetuneLabels(unittest.TestCase):
     def test_ltr_vocab_matches_fairseq_letters(self):
@@ -720,6 +867,200 @@ class TestFinetunePresets(unittest.TestCase):
         self.assertEqual(args.train_subsets, ["ll-1h"])
         self.assertEqual(args.max_batch_duration, 40.0)
 
+    def test_10h_pt100h_schedule_fully_decays_within_max_steps(self):
+
+        args = apply_preset(self._args("10h-pt100h"))
+        self.assertEqual(args.train_subsets, ["ll-10h"])
+        self.assertEqual(args.warmup_steps + args.hold_steps + args.decay_steps, args.max_steps)
+        self.assertLess(args.freeze_steps, args.warmup_steps)
+        self.assertEqual(args.max_batch_duration * 4 * args.accumulate_grad_batches, 200.0)
+
+        param = torch.nn.Parameter(torch.zeros(1))
+        opt = torch.optim.SGD([param], lr=args.lr)
+        sched = TriStageLRScheduler(
+            opt, warmup_steps=args.warmup_steps, hold_steps=args.hold_steps,
+            decay_steps=args.decay_steps, final_lr_scale=0.05,
+        )
+        self.assertAlmostEqual(sched._scale(args.max_steps - 1), 0.05, places=3)
+
+    def test_random_init_disables_freeze_unless_explicit(self):
+
+        args = apply_preset(self._args("10h", random_init=True))
+        self.assertEqual(args.freeze_steps, 0)
+        self.assertEqual(args.lr, 2e-5)
+        args = apply_preset(self._args("10h", random_init=True, freeze_steps=500))
+        self.assertEqual(args.freeze_steps, 500)
+        args = apply_preset(self._args("10h"))
+        self.assertEqual(args.freeze_steps, 10000)
+
+    def test_cli_requires_explicit_init_choice(self):
+
+        from experiments.hubert_train.finetune_hubert import run_train
+
+        args = argparse.Namespace(random_init=False, pretrained_path=None, sanity_check=False)
+        with self.assertRaisesRegex(ValueError, "--random-init"):
+            run_train(args)
+        args = argparse.Namespace(random_init=True, pretrained_path=Path("x.ckpt"), sanity_check=False)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            run_train(args)
+
+class TestSmallConfig(unittest.TestCase):
+    def test_small_is_narrower_and_shallower_than_base(self):
+
+        small = HubertModel(get_hubert_config("small", num_classes=[100], label_rate=100.0))
+        base = HubertModel(get_hubert_config("base", num_classes=[100], label_rate=100.0))
+        n_small = sum(p.numel() for p in small.parameters())
+        n_base = sum(p.numel() for p in base.parameters())
+        self.assertEqual(small.cfg.encoder_embed_dim, 512)
+        self.assertEqual(small.cfg.encoder_layers, 8)
+        self.assertIsNone(small.post_extract_proj)
+        self.assertLess(n_small, 0.4 * n_base)
+        self.assertGreater(n_small, 25_000_000)
+
+        source, lengths, targets = _tiny_batch(samples=16000, num_classes=100, label_rate=100.0)
+        loss = small.masked_prediction_loss(small(source, lengths, targets, mask=True))
+        self.assertTrue(torch.isfinite(loss))
+
+class TestGer(unittest.TestCase):
+    def _pretrain_args(self, **over):
+        base = dict(
+            model_size="tiny", num_classes="16", label_rate=50.0, mask_alpha=1.0, lr=1e-3,
+            weight_decay=0.0, warmup_ratio=0.1, max_steps=None, ger_layer=None,
+            ger_max_seconds=3600.0,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def test_gram_rank_matches_matrix_rank(self):
+
+        from experiments.hubert_train.compute_ger import effective_rank as cli_effective_rank
+        from src.models.hubert.ger import effective_rank_from_gram
+
+        x = torch.randn(500, 32) @ torch.diag(torch.linspace(0.1, 3.0, 32))
+        gram = x.double().T @ x.double()
+        self.assertAlmostEqual(effective_rank_from_gram(gram), cli_effective_rank(x), places=6)
+        few = x[:10]
+        self.assertAlmostEqual(
+            effective_rank_from_gram(few.double().T @ few.double()), cli_effective_rank(few), places=4
+        )
+
+    def test_validation_accumulator_matches_offline_computation(self):
+
+        from experiments.hubert_train.compute_ger import effective_rank as cli_effective_rank
+
+        torch.manual_seed(0)
+        module = HubertPretrainModule(self._pretrain_args())
+        module.eval()
+        self.assertEqual(module.ger_layer, module.model.cfg.encoder_layers)
+        module._ger_reset()
+        transform = DummyHubertPretrainTransform(num_classes=[16], label_rate=50.0)
+        frames, sums = [], []
+        for samples in _fake_librispeech_batches(4, 1):
+            batch = transform(samples)
+            module._ger_update(batch)
+            with torch.no_grad():
+                hidden, lengths, _ = module.model.extract_features(
+                    batch.inputs, batch.input_lengths, tgt_layer=module.ger_layer - 1
+                )
+            h = hidden[0, : int(lengths[0])]
+            frames.append(h)
+            sums.append(h.sum(dim=0))
+
+        from src.models.hubert.ger import effective_rank_from_gram
+
+        self.assertAlmostEqual(
+            effective_rank_from_gram(module._ger_gram), cli_effective_rank(torch.cat(frames)), places=5
+        )
+        self.assertAlmostEqual(
+            effective_rank_from_gram(module._ger_utt_gram), cli_effective_rank(torch.stack(sums)), places=5
+        )
+        self.assertEqual(int(module._ger_counts[1]), 4)
+
+    def test_budget_caps_audio(self):
+
+        module = HubertPretrainModule(self._pretrain_args(ger_max_seconds=1.0))
+        module.eval()
+        module._ger_reset()
+        transform = DummyHubertPretrainTransform(num_classes=[16], label_rate=50.0)
+        for samples in _fake_librispeech_batches(6, 1, seconds=0.5):
+            module._ger_update(transform(samples))
+        self.assertAlmostEqual(float(module._ger_counts[2]), 1.0)
+
+    def test_ger_logged_at_every_pretrain_epoch_end(self):
+
+        from pytorch_lightning import Trainer
+        from pytorch_lightning.loggers import CSVLogger
+        from src.data.librispeech_data_module import TransformDataset
+
+        torch.manual_seed(0)
+        transform = DummyHubertPretrainTransform(num_classes=[16], label_rate=50.0)
+        train = torch.utils.data.DataLoader(
+            TransformDataset(_fake_librispeech_batches(3, 2, seed=1), transform), batch_size=None
+        )
+        val = torch.utils.data.DataLoader(
+            TransformDataset(_fake_librispeech_batches(2, 2, seed=2), transform), batch_size=None
+        )
+        module = HubertPretrainModule(self._pretrain_args())
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = CSVLogger(tmp, name="lightning_logs")
+            trainer = Trainer(
+                max_epochs=3, logger=logger, accelerator="cpu", devices=1,
+                enable_checkpointing=False, enable_progress_bar=False, num_sanity_val_steps=1,
+                enable_model_summary=False,
+            )
+            trainer.fit(module, train, val)
+            with open(Path(logger.log_dir) / "metrics.csv", encoding="utf-8") as handle:
+                rows = [r for r in csv.DictReader(handle) if r.get("Metrics/val_ger")]
+
+        self.assertEqual([int(r["epoch"]) for r in rows], [0, 1, 2])
+        self.assertEqual([int(r["step"]) for r in rows], [2, 5, 8])
+        for r in rows:
+            self.assertGreater(float(r["Metrics/val_ger"]), 1.0)
+            self.assertLessEqual(float(r["Metrics/val_ger"]), module.model.cfg.encoder_embed_dim)
+            self.assertTrue(r["Metrics/val_rankme_t"])
+            self.assertTrue(r["Losses/val_loss"])
+
+    def test_ger_disabled_with_zero_budget(self):
+
+        module = HubertPretrainModule(self._pretrain_args(ger_max_seconds=0.0))
+        module._ger_update(None)
+        self.assertFalse(hasattr(module, "_ger_gram"))
+
+class TestFinetuneFit(unittest.TestCase):
+    def test_random_init_finetune_fit_trains_cnn_and_transformer(self):
+
+        from pytorch_lightning import Trainer
+        from src.data.librispeech_data_module import TransformDataset
+
+        torch.manual_seed(0)
+        args = argparse.Namespace(
+            model_size="tiny", num_classes="16", label_rate=50.0, mask_alpha=1.0, lr=1e-3,
+            freeze_steps=0, unfreeze_steps=0, warmup_steps=2, hold_steps=2, decay_steps=2,
+            pretrained_path=None, random_init=True, apply_ft_mask=False, layerdrop=0.0,
+        )
+        module = HubertCTCModule(args)
+        before = {k: v.clone() for k, v in module.encoder.state_dict().items()}
+        transform = HubertCharFinetuneTransform()
+        loader = torch.utils.data.DataLoader(
+            TransformDataset(_fake_librispeech_batches(3, 2, seconds=1.0), transform), batch_size=None
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            trainer = Trainer(
+                max_steps=3, logger=False, accelerator="cpu", devices=1, default_root_dir=tmp,
+                enable_checkpointing=False, enable_progress_bar=False, enable_model_summary=False,
+                limit_val_batches=0,
+            )
+            trainer.fit(module, loader)
+        after = module.encoder.state_dict()
+        cnn_changed = [
+            not torch.equal(before[k], after[k]) for k in after if k.startswith("feature_extractor") and "weight" in k
+        ]
+        layer_changed = [
+            not torch.equal(before[k], after[k]) for k in after if k.startswith("encoder.layers.") and k.endswith("fc1.weight")
+        ]
+        self.assertTrue(any(cnn_changed))
+        self.assertTrue(all(layer_changed))
+
 class TestScheduler(unittest.TestCase):
     def test_tri_stage_warmup_hold_then_exponential_decay(self):
 
@@ -757,6 +1098,87 @@ class TestScheduler(unittest.TestCase):
         self.assertGreater(peak, 0.9)
         self.assertLess(lrs[-1], lrs[20])
         self.assertLess(lrs[-1], 0.15)
+
+def _has_module(name):
+    import importlib.util
+
+    return importlib.util.find_spec(name) is not None
+
+@unittest.skipUnless(_has_module("umap") and _has_module("matplotlib"), "umap-learn / matplotlib not installed")
+class TestUmapEmbeddings(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls._tmp.name)
+        _fake_corpora(cls.root)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def _args(self, out_dir, **over):
+        base = dict(
+            checkpoint_path=None, random_init=False, librispeech_path=self.root, out_dir=out_dir,
+            subsets=["ll-10h"], model_size=None, num_classes=None, label_rate=None, layer=None,
+            num_speakers=20, utts_per_speaker=10, frames_per_utt=20, km_path=None, km_labels=None,
+            km_label_rate=100.0, phone_alignments=None, phone_rate=100.0, phone_mapping=None,
+            letter_source="align", n_clusters=4, n_neighbors=5, min_dist=0.1, metric="cosine",
+            knn=3, point_size=2.0, label=None, save_embeddings=False, seed=0, use_cuda=False,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def test_finetuned_checkpoint_plots_every_colouring(self):
+
+        import joblib
+
+        from experiments.hubert_train.umap_embeddings import run_umap
+
+        torch.manual_seed(0)
+        module = HubertCTCModule(argparse.Namespace(
+            model_size="tiny", num_classes="16", label_rate=50.0, mask_alpha=1.0, lr=1e-3,
+            freeze_steps=0, warmup_steps=1, pretrained_path=None,
+        ))
+        out = self.root / "umap_ft"
+        ckpt = self.root / "ft.ckpt"
+        torch.save({"state_dict": module.state_dict(), "hyper_parameters": {"model_size": "tiny",
+                    "num_classes": "16", "label_rate": 50.0}, "global_step": 7}, ckpt)
+        km = MiniBatchKMeans(n_clusters=5, random_state=0, n_init=1).fit(np.random.RandomState(0).randn(200, 39))
+        km_path = self.root / "km.bin"
+        joblib.dump(km, km_path)
+        phones = self.root / "phones.txt"
+        phones.write_text("103-1241-0000 " + " ".join(["3"] * 100) + "\n103-1241-0001 1 2 3\n")
+
+        meta = run_umap(self._args(out, checkpoint_path=ckpt, km_path=km_path, phone_alignments=phones))
+
+        self.assertEqual(meta["model_size"], "tiny")
+        self.assertEqual(meta["checkpoint_step"], 7)
+        self.assertTrue(meta["finetuned"])
+        self.assertEqual(meta["n_speakers"], 2)
+        self.assertEqual(meta["n_utterances"], 10)
+        self.assertEqual(meta["stats"]["phones_mismatched"], 1)
+        for key in ("speaker", "letter", "teacher", "emb_kmeans", "utterance_speaker"):
+            self.assertIn(key, meta["purity"])
+        for name in ("speaker", "letter", "teacher", "emb_kmeans", "phone"):
+            self.assertTrue((out / f"umap_frames_{name}.png").is_file(), name)
+        self.assertTrue((out / "umap_utterances_speaker.png").is_file())
+        self.assertTrue((out / "umap_overview.png").is_file())
+        points = np.load(out / "umap_points.npz")
+        self.assertEqual(points["coords"].shape, (meta["n_frames"], 2))
+        self.assertEqual(points["letter"].shape[0], meta["n_frames"])
+        self.assertTrue((points["letter"] >= 0).any())
+        self.assertNotIn("frames", points.files)
+
+    def test_random_init_reference_needs_no_checkpoint(self):
+
+        from experiments.hubert_train.umap_embeddings import run_umap
+
+        out = self.root / "umap_rand"
+        meta = run_umap(self._args(out, random_init=True, model_size="tiny", num_classes="16", label_rate=50.0))
+        self.assertEqual(meta["init"], "random")
+        self.assertNotIn("letter", meta["purity"])
+        self.assertTrue((out / "umap_frames_speaker.png").is_file())
+        self.assertFalse((out / "umap_frames_letter.png").exists())
 
 if __name__ == "__main__":
     unittest.main()
