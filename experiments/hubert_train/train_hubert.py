@@ -3,13 +3,25 @@ from argparse import ArgumentParser
 
 import torch
 from pytorch_lightning import seed_everything, Trainer
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
 
 from src.data.hubert_data_module import get_hubert_pretrain_data_module
 from src.models.hubert.config import HUBERT_SIZES
 from src.models.hubert_lightning_module import HubertPretrainModule
+
+
+class GerEarlyStopping(EarlyStopping):
+    def __init__(self, min_steps=0, **kwargs):
+        super().__init__(**kwargs)
+        self.min_steps = int(min_steps)
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.global_step < self.min_steps:
+            return
+        super().on_validation_end(trainer, pl_module)
+
 
 def run_train(args):
     seed_everything(1)
@@ -31,11 +43,32 @@ def run_train(args):
         save_weights_only=False,
         verbose=True,
     )
+    ger_checkpoint = ModelCheckpoint(
+        checkpoint_dir,
+        filename="ger-{epoch}-{step}",
+        monitor="Metrics/val_ger",
+        mode="max",
+        save_top_k=3,
+        save_weights_only=False,
+        verbose=True,
+    )
+    min_steps = args.ger_min_steps if args.ger_min_steps is not None else int(args.warmup_ratio * args.max_steps)
+    early_stop = GerEarlyStopping(
+        monitor="Metrics/val_ger",
+        mode="max",
+        patience=20,
+        min_delta=0.5,
+        min_steps=min_steps,
+        verbose=True,
+        check_on_train_epoch_end=False,
+    )
     lr_monitor = LearningRateMonitor(logging_interval="step")
     callbacks = [
         checkpoint,
         train_checkpoint,
         lr_monitor,
+        ger_checkpoint,
+        early_stop,
     ]
     tb_logger = TensorBoardLogger(save_dir=args.exp_dir, name="lightning_logs", version=None)
     loggers = [
@@ -46,15 +79,9 @@ def run_train(args):
         default_root_dir=args.exp_dir,
         logger=loggers,
         num_nodes=args.nodes,
-        devices=(
-            args.gpus if torch.cuda.is_available() else "auto"
-            ),
-        accelerator=(
-            "gpu" if torch.cuda.is_available() else "auto"
-            ),
-        strategy=(
-            DDPStrategy(find_unused_parameters=True) if torch.cuda.is_available() else "auto"
-            ),
+        devices=(args.gpus if torch.cuda.is_available() else "auto"),
+        accelerator=("gpu" if torch.cuda.is_available() else "auto"),
+        strategy=(DDPStrategy(find_unused_parameters=True) if torch.cuda.is_available() else "auto"),
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=0,
         precision="32-true",
@@ -84,14 +111,13 @@ def run_train(args):
         num_classes=[int(v) for v in str(args.num_classes).split(",") if str(v).strip()],
         label_rate=float(args.label_rate),
         sanity_check=bool(args.sanity_check),
-        durations_cache_dir=str(args.durations_cache_dir)
-        if args.durations_cache_dir
-        else None,
+        durations_cache_dir=str(args.durations_cache_dir) if args.durations_cache_dir else None,
         num_workers=args.num_workers,
         max_batch_duration=float(args.max_batch_duration),
         train_subsets=args.train_subsets,
-        )
+    )
     trainer.fit(model, data_module, ckpt_path=args.checkpoint_path)
+
 
 def cli_main():
     parser = ArgumentParser()
@@ -124,10 +150,7 @@ def cli_main():
         "--train-subsets",
         nargs="+",
         default=["train-clean-100", "train-clean-360", "train-other-500"],
-        help=(
-            "LibriSpeech splits to pre-train on. Use 'train-clean-100' for 100 h. "
-            "(Default: all 960 h)"
-        ),
+        help=("LibriSpeech splits to pre-train on. Use 'train-clean-100' for 100 h. (Default: all 960 h)"),
     )
     parser.add_argument(
         "--durations-cache-dir",
@@ -181,8 +204,7 @@ def cli_main():
         default=0.08,
         type=float,
         help=(
-            "Fraction of frames used as mask span starts, = fairseq mask_prob 0.80 "
-            "divided by span 10. (Default: 0.08)"
+            "Fraction of frames used as mask span starts, = fairseq mask_prob 0.80 divided by span 10. (Default: 0.08)"
         ),
     )
     parser.add_argument(
@@ -242,8 +264,7 @@ def cli_main():
         default=16,
         type=int,
         help=(
-            "Gradient accumulation. Default 16 with 4 GPUs and batch 43.75s "
-            "→ same effective audio as paper 32×87.5s."
+            "Gradient accumulation. Default 16 with 4 GPUs and batch 43.75s → same effective audio as paper 32×87.5s."
         ),
     )
     parser.add_argument(
@@ -257,8 +278,15 @@ def cli_main():
         action="store_true",
         help="Run sanity check with small subset of data.",
     )
+    parser.add_argument(
+        "--ger-min-steps",
+        default=None,
+        type=int,
+        help="Do not start GER patience before this step. Default: warmup_ratio * max_steps.",
+    )
     args = parser.parse_args()
     run_train(args)
+
 
 if __name__ == "__main__":
     cli_main()
